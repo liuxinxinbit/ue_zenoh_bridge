@@ -115,6 +115,347 @@ std::pair<std::string, std::string> split_mapping(const std::string & mapping)
   return {mapping.substr(0, pos), mapping.substr(pos + sep_len)};
 }
 
+class CdrReader
+{
+public:
+  explicit CdrReader(const std::vector<uint8_t> & payload)
+  : data_(payload.data()), size_(payload.size()), pos_(4), ok_(payload.size() >= 4)
+  {
+    if (!ok_ || payload[0] != 0x00 || payload[1] != 0x01) {
+      ok_ = false;
+    }
+  }
+
+  bool ok() const { return ok_; }
+  bool end() const { return ok_ && pos_ == size_; }
+
+  bool read_u8(uint8_t & value)
+  {
+    if (!align(1) || !require(1)) {
+      return false;
+    }
+    value = data_[pos_++];
+    return true;
+  }
+
+  bool read_bool()
+  {
+    uint8_t value = 0;
+    return read_u8(value);
+  }
+
+  bool read_i32(int32_t & value)
+  {
+    uint32_t raw = 0;
+    if (!read_u32(raw)) {
+      return false;
+    }
+    value = static_cast<int32_t>(raw);
+    return true;
+  }
+
+  bool read_u32(uint32_t & value)
+  {
+    if (!align(4) || !require(4)) {
+      return false;
+    }
+    value = static_cast<uint32_t>(data_[pos_]) |
+      (static_cast<uint32_t>(data_[pos_ + 1]) << 8) |
+      (static_cast<uint32_t>(data_[pos_ + 2]) << 16) |
+      (static_cast<uint32_t>(data_[pos_ + 3]) << 24);
+    pos_ += 4;
+    return true;
+  }
+
+  bool read_f32(float & value)
+  {
+    uint32_t raw = 0;
+    if (!read_u32(raw)) {
+      return false;
+    }
+    std::memcpy(&value, &raw, sizeof(value));
+    return true;
+  }
+
+  bool read_f64(double & value)
+  {
+    if (!align(8) || !require(8)) {
+      return false;
+    }
+    uint64_t raw = 0;
+    for (int i = 0; i < 8; ++i) {
+      raw |= static_cast<uint64_t>(data_[pos_ + i]) << (8 * i);
+    }
+    std::memcpy(&value, &raw, sizeof(value));
+    pos_ += 8;
+    return true;
+  }
+
+  bool read_string(std::string * value = nullptr, std::size_t max_length = 4096)
+  {
+    uint32_t length = 0;
+    if (!read_u32(length) || length == 0 || length > max_length || !require(length)) {
+      return false;
+    }
+    if (data_[pos_ + length - 1] != 0) {
+      ok_ = false;
+      return false;
+    }
+    if (value) {
+      value->assign(reinterpret_cast<const char *>(data_ + pos_), length - 1);
+    }
+    pos_ += length;
+    return align(4);
+  }
+
+  bool skip(std::size_t count)
+  {
+    if (!require(count)) {
+      return false;
+    }
+    pos_ += count;
+    return true;
+  }
+
+private:
+  bool align(std::size_t alignment)
+  {
+    if (!ok_ || alignment == 0) {
+      ok_ = false;
+      return false;
+    }
+    const std::size_t relative = pos_ >= 4 ? pos_ - 4 : 0;
+    const std::size_t padding = (alignment - (relative % alignment)) % alignment;
+    return skip(padding);
+  }
+
+  bool require(std::size_t count)
+  {
+    if (!ok_ || count > size_ - pos_) {
+      ok_ = false;
+      return false;
+    }
+    return true;
+  }
+
+  const uint8_t * data_;
+  std::size_t size_;
+  std::size_t pos_;
+  bool ok_;
+};
+
+struct PointFieldInfo
+{
+  std::string name;
+  uint32_t offset{0};
+  uint8_t datatype{0};
+  uint32_t count{0};
+};
+
+bool read_header(CdrReader & reader)
+{
+  int32_t sec = 0;
+  uint32_t nanosec = 0;
+  return reader.read_i32(sec) && reader.read_u32(nanosec) && nanosec < 1000000000u &&
+         reader.read_string(nullptr, 1024);
+}
+
+bool skip_f64_array(CdrReader & reader, std::size_t count)
+{
+  double ignored = 0.0;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!reader.read_f64(ignored)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::size_t point_field_datatype_size(uint8_t datatype)
+{
+  switch (datatype) {
+    case 1:  // INT8
+    case 2:  // UINT8
+      return 1;
+    case 3:  // INT16
+    case 4:  // UINT16
+      return 2;
+    case 5:  // INT32
+    case 6:  // UINT32
+    case 7:  // FLOAT32
+      return 4;
+    case 8:  // FLOAT64
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+bool has_point_field(const std::vector<PointFieldInfo> & fields, const std::string & name)
+{
+  return std::any_of(fields.begin(), fields.end(), [&](const PointFieldInfo & field) {
+    return field.name == name;
+  });
+}
+
+bool looks_like_pointcloud2(const std::vector<uint8_t> & payload)
+{
+  CdrReader reader(payload);
+  if (!reader.ok() || !read_header(reader)) {
+    return false;
+  }
+
+  uint32_t height = 0;
+  uint32_t width = 0;
+  uint32_t field_count = 0;
+  if (!reader.read_u32(height) || !reader.read_u32(width) || !reader.read_u32(field_count)) {
+    return false;
+  }
+  if (height == 0 || width == 0 || field_count == 0 || field_count > 64) {
+    return false;
+  }
+
+  std::vector<PointFieldInfo> fields;
+  fields.reserve(field_count);
+  for (uint32_t i = 0; i < field_count; ++i) {
+    PointFieldInfo field;
+    if (!reader.read_string(&field.name, 256) || !reader.read_u32(field.offset) ||
+        !reader.read_u8(field.datatype) || !reader.read_u32(field.count)) {
+      return false;
+    }
+    if (field.name.empty() || field.count == 0 || point_field_datatype_size(field.datatype) == 0) {
+      return false;
+    }
+    fields.push_back(std::move(field));
+  }
+
+  if (!has_point_field(fields, "x") || !has_point_field(fields, "y") ||
+      !has_point_field(fields, "z")) {
+    return false;
+  }
+
+  if (!reader.read_bool()) {
+    return false;
+  }
+  uint32_t point_step = 0;
+  uint32_t row_step = 0;
+  uint32_t data_len = 0;
+  if (!reader.read_u32(point_step) || !reader.read_u32(row_step) || !reader.read_u32(data_len)) {
+    return false;
+  }
+  if (point_step == 0 || point_step > 4096) {
+    return false;
+  }
+
+  const uint64_t expected_row_step = static_cast<uint64_t>(width) * point_step;
+  const uint64_t expected_data_len = expected_row_step * height;
+  if (expected_row_step > UINT32_MAX || expected_data_len > UINT32_MAX ||
+      row_step != expected_row_step || data_len != expected_data_len) {
+    return false;
+  }
+
+  for (const auto & field : fields) {
+    const uint64_t extent = static_cast<uint64_t>(field.offset) +
+      static_cast<uint64_t>(point_field_datatype_size(field.datatype)) * field.count;
+    if (extent > point_step) {
+      return false;
+    }
+  }
+
+  return reader.skip(data_len) && reader.read_bool() && reader.end();
+}
+
+bool looks_like_compressed_image(const std::vector<uint8_t> & payload)
+{
+  CdrReader reader(payload);
+  std::string format;
+  uint32_t data_len = 0;
+  return reader.ok() && read_header(reader) && reader.read_string(&format, 128) &&
+         !format.empty() && reader.read_u32(data_len) && data_len > 0 &&
+         reader.skip(data_len) && reader.end();
+}
+
+bool looks_like_imu(const std::vector<uint8_t> & payload)
+{
+  CdrReader reader(payload);
+  return reader.ok() && read_header(reader) && skip_f64_array(reader, 37) && reader.end();
+}
+
+bool looks_like_odometry(const std::vector<uint8_t> & payload)
+{
+  CdrReader reader(payload);
+  return reader.ok() && read_header(reader) && reader.read_string(nullptr, 1024) &&
+         skip_f64_array(reader, 85) && reader.end();
+}
+
+bool looks_like_unirtk_pvh(const std::vector<uint8_t> & payload)
+{
+  CdrReader reader(payload);
+  double f64 = 0.0;
+  float f32 = 0.0f;
+  uint8_t u8 = 0;
+
+  if (!reader.ok() || !read_header(reader) || !read_header(reader) || !reader.read_f64(f64) ||
+      !reader.read_u8(u8) || !reader.read_u8(u8)) {
+    return false;
+  }
+  for (int i = 0; i < 5; ++i) {
+    if (!reader.read_f32(f32)) {
+      return false;
+    }
+  }
+  if (!reader.read_u8(u8) || !reader.read_u8(u8) || !read_header(reader) ||
+      !reader.read_f64(f64) || !reader.read_u8(u8) || !reader.read_u8(u8)) {
+    return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (!reader.read_f64(f64)) {
+      return false;
+    }
+  }
+  for (int i = 0; i < 5; ++i) {
+    if (!reader.read_f32(f32)) {
+      return false;
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (!reader.read_u8(u8)) {
+      return false;
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (!reader.read_f64(f64)) {
+      return false;
+    }
+  }
+  for (int i = 0; i < 2; ++i) {
+    if (!reader.read_f32(f32)) {
+      return false;
+    }
+  }
+  return reader.end();
+}
+
+std::string detect_type_from_payload(const std::vector<uint8_t> & payload)
+{
+  if (looks_like_pointcloud2(payload)) {
+    return "sensor_msgs/msg/PointCloud2";
+  }
+  if (looks_like_compressed_image(payload)) {
+    return "sensor_msgs/msg/CompressedImage";
+  }
+  if (looks_like_imu(payload)) {
+    return "sensor_msgs/msg/Imu";
+  }
+  if (looks_like_odometry(payload)) {
+    return "nav_msgs/msg/Odometry";
+  }
+  if (looks_like_unirtk_pvh(payload)) {
+    return "robots_dog_msgs/msg/UniRtkPvh";
+  }
+  return "";
+}
+
 std::string default_type_for_topic(const std::string & topic)
 {
   if (ends_with(topic, "/image/compressed") || ends_with(topic, "/image")) {
@@ -414,7 +755,7 @@ private:
     }
 
     const std::string topic = topic_from_key(sample.key, strip_prefix_);
-    std::string type = resolve_type(sample.key, topic);
+    std::string type = resolve_type(sample.key, topic, sample.payload);
     if (type.empty()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -447,7 +788,8 @@ private:
     }
   }
 
-  std::string resolve_type(const std::string & key, const std::string & topic) const
+  std::string resolve_type(
+    const std::string & key, const std::string & topic, const std::vector<uint8_t> & payload) const
   {
     if (const auto it = type_overrides_.find(key); it != type_overrides_.end()) {
       return it->second;
@@ -455,7 +797,13 @@ private:
     if (const auto it = type_overrides_.find(topic); it != type_overrides_.end()) {
       return it->second;
     }
-    std::string type = default_type_for_key_or_topic(key);
+
+    std::string type = detect_type_from_payload(payload);
+    if (!type.empty()) {
+      return type;
+    }
+
+    type = default_type_for_key_or_topic(key);
     if (!type.empty()) {
       return type;
     }

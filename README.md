@@ -47,9 +47,9 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge \
   --key-expr 'rt/**'
 ```
 
-## 4. 默认 key 到 topic/type 映射
+## 4. 默认 key 到 topic 和自动类型识别
 
-默认去掉 key 前缀 `rt/`，再在前面加 `/`：
+默认去掉 key 前缀 `rt/`，再在前面加 `/`。topic 名称只决定 ROS topic，不再决定传感器消息类型：
 
 ```text
 rt/camera/front/image/compressed  ->  /camera/front/image/compressed
@@ -64,16 +64,15 @@ rt/odom/mujoco_odom               ->  /odom/mujoco_odom
 rt/odom/mujoco_gps                ->  /odom/mujoco_gps
 ```
 
-默认类型推断：
+收到 Zenoh payload 后，bridge 会先解析 CDR 结构自动识别 ROS 类型：
 
-- `*/image/compressed`、`*/image` -> `sensor_msgs/msg/CompressedImage`；`*/image` 会自动规范化为 `*/image/compressed`
-- `*lidar*`、`*/pointcloud2`、`*/points`、`*/points_raw` -> `sensor_msgs/msg/PointCloud2`
-- `*/imu` -> `sensor_msgs/msg/Imu`
-- `*/odom`、`*/odom/*`、`*/mujoco_odom` -> `nav_msgs/msg/Odometry`
-- `*/gps`、`*/mujoco_gps` -> `robots_dog_msgs/msg/UniRtkPvh`
-- `*/unirtk_pvh`、`*/rtk/pvh`、`*/pvh` -> `robots_dog_msgs/msg/UniRtkPvh`
+- `sensor_msgs/msg/PointCloud2`
+- `sensor_msgs/msg/CompressedImage`
+- `sensor_msgs/msg/Imu`
+- `nav_msgs/msg/Odometry`
+- `robots_dog_msgs/msg/UniRtkPvh`
 
-通常直接启动即可自动映射 UE 默认传感器 key：
+识别顺序是：显式 `--topic-type` 覆盖 > CDR payload 自动识别 > 旧 topic 后缀规则兜底。通常直接启动即可自动转发 UE 默认传感器 key：
 
 ```bash
 ros2 run ue_zenoh_bridge ue_zenoh_bridge --key-expr 'rt/**'

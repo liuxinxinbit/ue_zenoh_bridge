@@ -68,7 +68,7 @@ ament_target_dependencies(ue_zenoh_bridge rclcpp rcutils sensor_msgs nav_msgs ro
 install(TARGETS ue_zenoh_bridge
   DESTINATION lib/${PROJECT_NAME})
 
-install(FILES UE_ZENOH_BRIDGE_USAGE.md
+install(FILES README.md
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()
