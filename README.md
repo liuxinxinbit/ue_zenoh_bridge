@@ -10,10 +10,14 @@ bridge 端使用 `rclcpp::GenericPublisher` 直接发布序列化消息，不再
 
 - ROS2 Humble 或更新版本
 - `colcon`
-- ROS 环境中的 `zenoh_cpp_vendor`，或系统安装的 zenoh-c 开发库
 - UE 端已连接到同一个 zenoh router 或 peer 网络
 
-在 ROS2 Humble 环境下，包会优先使用 `/opt/ros/humble` 提供的 `zenoh_cpp_vendor`，通常不需要手动设置 `ZENOHC_ROOT`。
+包内已经固定携带 zenoh-c 1.9.0 的头文件和 Linux x86_64 动态库。构建和运行均不读取
+系统 zenoh-c、`zenoh_cpp_vendor`、`ZENOHC_ROOT`、`ZENOH_C_ROOT` 或 UESim 源码目录。
+安装时 `libzenohc.so` 会放在 bridge 可执行文件旁边，并通过 `$ORIGIN` 强制加载。
+
+当前内置二进制只支持 Linux x86_64；其他系统或架构会在 CMake 配置阶段明确报错，需在
+`ThirdParty/zenoh-c` 中加入同版本的平台库后再扩展 CMake。
 
 ## 2. 构建
 
@@ -113,11 +117,15 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge --best-effort
 ros2 run ue_zenoh_bridge ue_zenoh_bridge --reliable --qos-depth 10
 ```
 
-bridge 内部 zenoh callback 到 ROS 发布线程之间有队列，默认深度 1024：
+bridge 内部 zenoh callback 到 ROS 发布线程之间使用有界“最新帧”队列，默认最多保留 64 个
+不同 key 的待发消息。同一 key 在等待发布期间只保留最新一帧；队列满时会淘汰最旧消息，避免
+过载时持续转发陈旧传感器数据：
 
 ```bash
-ros2 run ue_zenoh_bridge ue_zenoh_bridge --max-queue-depth 4096
+ros2 run ue_zenoh_bridge ue_zenoh_bridge --max-queue-depth 64
 ```
+
+对低延迟传感器转发，建议不要把该值调大；`1` 到 `64` 通常比大队列更合适。
 
 ## 7. 验证
 
@@ -145,23 +153,10 @@ ros2 topic type /imu
 
 ## 8. 常见问题
 
-### CMake 找不到 zenoh-c
+### CMake 报 bundled zenoh-c 文件缺失
 
-先确认已经 source ROS 环境：
-
-```bash
-source /opt/ros/humble/setup.bash
-```
-
-Humble 下默认使用 `zenoh_cpp_vendor` 提供的 zenoh-c：
-
-```text
-/opt/ros/humble/opt/zenoh_cpp_vendor/include/zenoh.h
-/opt/ros/humble/opt/zenoh_cpp_vendor/lib/libzenohc.so
-```
-
-如果使用非 ROS 安装的 zenoh-c，再检查系统是否能通过 `pkg-config --modversion zenohc`
-发现它。
+确认源码包包含 `ThirdParty/zenoh-c/include/zenoh.h` 和
+`ThirdParty/zenoh-c/lib/linux-x86_64/libzenohc.so`。bridge 不会回退使用系统 zenoh-c。
 
 ### ROS2 topic 看不到
 

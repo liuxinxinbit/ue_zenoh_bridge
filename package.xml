@@ -13,7 +13,6 @@
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>robots_dog_msgs</depend>
-  <depend>zenoh_cpp_vendor</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

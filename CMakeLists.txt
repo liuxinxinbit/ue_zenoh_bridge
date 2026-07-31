@@ -12,63 +12,67 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(robots_dog_msgs REQUIRED)
 
-find_package(zenoh_cpp_vendor QUIET)
-find_package(zenohc QUIET CONFIG)
+set(ZENOHC_VERSION "1.9.0")
+set(ZENOHC_VENDOR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/zenoh-c")
+set(ZENOHC_VENDOR_INCLUDE_DIR "${ZENOHC_VENDOR_ROOT}/include")
 
-if(NOT TARGET zenohc::lib)
-  find_package(PkgConfig QUIET)
-endif()
-if(NOT TARGET zenohc::lib AND PkgConfig_FOUND)
-  pkg_check_modules(ZENOHC QUIET zenohc)
-endif()
-
-if(NOT TARGET zenohc::lib AND NOT ZENOHC_FOUND)
-  find_path(
-    ZENOHC_INCLUDE_DIR
-    NAMES zenoh.h
-    HINTS
-      "/opt/ros/$ENV{ROS_DISTRO}/opt/zenoh_cpp_vendor/include"
-      "$ENV{ZENOHC_ROOT}/include"
-      "$ENV{ZENOH_C_ROOT}/include"
-      "/usr/local/include"
-      "/usr/include")
-
-  find_library(
-    ZENOHC_LIBRARY
-    NAMES zenohc zenoh
-    HINTS
-      "/opt/ros/$ENV{ROS_DISTRO}/opt/zenoh_cpp_vendor/lib"
-      "$ENV{ZENOHC_ROOT}/lib"
-      "$ENV{ZENOH_C_ROOT}/lib"
-      "/usr/local/lib"
-      "/usr/lib")
-
-  if(ZENOHC_INCLUDE_DIR AND ZENOHC_LIBRARY)
-    set(ZENOHC_INCLUDE_DIRS "${ZENOHC_INCLUDE_DIR}")
-    set(ZENOHC_LIBRARIES "${ZENOHC_LIBRARY}")
-    set(ZENOHC_FOUND TRUE)
-  endif()
-endif()
-
-if(NOT TARGET zenohc::lib AND NOT ZENOHC_FOUND)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR
-    "Could not find zenoh-c. Install zenoh_cpp_vendor/zenoh-c development files.")
+    "The bundled zenoh-c ${ZENOHC_VERSION} library currently supports Linux x86_64 only.")
 endif()
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" UE_ZENOH_SYSTEM_PROCESSOR)
+if(NOT UE_ZENOH_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+  message(FATAL_ERROR
+    "The bundled zenoh-c ${ZENOHC_VERSION} library does not support "
+    "${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}.")
+endif()
+
+set(
+  ZENOHC_VENDOR_LIBRARY
+  "${ZENOHC_VENDOR_ROOT}/lib/linux-x86_64/libzenohc.so")
+
+foreach(required_file
+    "${ZENOHC_VENDOR_INCLUDE_DIR}/zenoh.h"
+    "${ZENOHC_VENDOR_LIBRARY}")
+  if(NOT EXISTS "${required_file}")
+    message(FATAL_ERROR
+      "Missing bundled zenoh-c ${ZENOHC_VERSION} file: ${required_file}")
+  endif()
+endforeach()
+
+add_library(zenohc_vendor SHARED IMPORTED GLOBAL)
+set_target_properties(zenohc_vendor PROPERTIES
+  IMPORTED_LOCATION "${ZENOHC_VENDOR_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${ZENOHC_VENDOR_INCLUDE_DIR}")
 
 add_executable(ue_zenoh_bridge src/bridge_node.cpp)
 target_compile_features(ue_zenoh_bridge PUBLIC cxx_std_17)
-if(TARGET zenohc::lib)
-  target_link_libraries(ue_zenoh_bridge zenohc::lib)
-else()
-  target_include_directories(ue_zenoh_bridge PRIVATE ${ZENOHC_INCLUDE_DIRS})
-  target_link_libraries(ue_zenoh_bridge ${ZENOHC_LIBRARIES})
-endif()
+target_link_libraries(ue_zenoh_bridge zenohc_vendor)
 ament_target_dependencies(ue_zenoh_bridge rclcpp rcutils sensor_msgs nav_msgs robots_dog_msgs)
+set_target_properties(ue_zenoh_bridge PROPERTIES
+  BUILD_RPATH "${ZENOHC_VENDOR_ROOT}/lib/linux-x86_64"
+  INSTALL_RPATH "$ORIGIN"
+  INSTALL_RPATH_USE_LINK_PATH FALSE)
+# Emit DT_RPATH instead of DT_RUNPATH so a ROS environment containing another
+# libzenohc.so in LD_LIBRARY_PATH cannot override the bundled 1.9.0 runtime.
+set_property(
+  TARGET ue_zenoh_bridge APPEND_STRING
+  PROPERTY LINK_FLAGS " -Wl,--disable-new-dtags")
 
 install(TARGETS ue_zenoh_bridge
   DESTINATION lib/${PROJECT_NAME})
 
+install(FILES "${ZENOHC_VENDOR_LIBRARY}"
+  DESTINATION lib/${PROJECT_NAME})
+
 install(FILES README.md
   DESTINATION share/${PROJECT_NAME})
+
+install(FILES
+    ThirdParty/zenoh-c/README.md
+    ThirdParty/zenoh-c/LICENSE
+    ThirdParty/zenoh-c/NOTICE.md
+  DESTINATION share/${PROJECT_NAME}/third_party/zenoh-c)
 
 ament_package()

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -30,7 +31,9 @@ struct BridgeCli
   std::string strip_prefix{"rt"};
   std::vector<std::string> predeclare_topics;
   std::vector<std::string> topic_type_overrides;
-  int max_queue_depth{1024};
+  // This bounds the number of distinct keys waiting for ROS publication.  New
+  // samples for a key that is already waiting replace the older sample.
+  int max_queue_depth{64};
   int qos_depth{10};
   bool reliable{false};
   bool verbose{false};
@@ -39,7 +42,7 @@ struct BridgeCli
 struct ZenohSample
 {
   std::string key;
-  std::vector<uint8_t> payload;
+  rclcpp::SerializedMessage payload;
 };
 
 bool starts_with(const std::string & value, const std::string & prefix)
@@ -118,10 +121,10 @@ std::pair<std::string, std::string> split_mapping(const std::string & mapping)
 class CdrReader
 {
 public:
-  explicit CdrReader(const std::vector<uint8_t> & payload)
-  : data_(payload.data()), size_(payload.size()), pos_(4), ok_(payload.size() >= 4)
+  CdrReader(const uint8_t * data, std::size_t size)
+  : data_(data), size_(size), pos_(4), ok_(data != nullptr && size >= 4)
   {
-    if (!ok_ || payload[0] != 0x00 || payload[1] != 0x01) {
+    if (!ok_ || data_[0] != 0x00 || data_[1] != 0x01) {
       ok_ = false;
     }
   }
@@ -298,9 +301,9 @@ bool has_point_field(const std::vector<PointFieldInfo> & fields, const std::stri
   });
 }
 
-bool looks_like_pointcloud2(const std::vector<uint8_t> & payload)
+bool looks_like_pointcloud2(const uint8_t * payload, std::size_t payload_size)
 {
-  CdrReader reader(payload);
+  CdrReader reader(payload, payload_size);
   if (!reader.ok() || !read_header(reader)) {
     return false;
   }
@@ -365,9 +368,9 @@ bool looks_like_pointcloud2(const std::vector<uint8_t> & payload)
   return reader.skip(data_len) && reader.read_bool() && reader.end();
 }
 
-bool looks_like_compressed_image(const std::vector<uint8_t> & payload)
+bool looks_like_compressed_image(const uint8_t * payload, std::size_t payload_size)
 {
-  CdrReader reader(payload);
+  CdrReader reader(payload, payload_size);
   std::string format;
   uint32_t data_len = 0;
   return reader.ok() && read_header(reader) && reader.read_string(&format, 128) &&
@@ -375,22 +378,22 @@ bool looks_like_compressed_image(const std::vector<uint8_t> & payload)
          reader.skip(data_len) && reader.end();
 }
 
-bool looks_like_imu(const std::vector<uint8_t> & payload)
+bool looks_like_imu(const uint8_t * payload, std::size_t payload_size)
 {
-  CdrReader reader(payload);
+  CdrReader reader(payload, payload_size);
   return reader.ok() && read_header(reader) && skip_f64_array(reader, 37) && reader.end();
 }
 
-bool looks_like_odometry(const std::vector<uint8_t> & payload)
+bool looks_like_odometry(const uint8_t * payload, std::size_t payload_size)
 {
-  CdrReader reader(payload);
+  CdrReader reader(payload, payload_size);
   return reader.ok() && read_header(reader) && reader.read_string(nullptr, 1024) &&
          skip_f64_array(reader, 85) && reader.end();
 }
 
-bool looks_like_unirtk_pvh(const std::vector<uint8_t> & payload)
+bool looks_like_unirtk_pvh(const uint8_t * payload, std::size_t payload_size)
 {
-  CdrReader reader(payload);
+  CdrReader reader(payload, payload_size);
   double f64 = 0.0;
   float f32 = 0.0f;
   uint8_t u8 = 0;
@@ -436,21 +439,21 @@ bool looks_like_unirtk_pvh(const std::vector<uint8_t> & payload)
   return reader.end();
 }
 
-std::string detect_type_from_payload(const std::vector<uint8_t> & payload)
+std::string detect_type_from_payload(const uint8_t * payload, std::size_t payload_size)
 {
-  if (looks_like_pointcloud2(payload)) {
+  if (looks_like_pointcloud2(payload, payload_size)) {
     return "sensor_msgs/msg/PointCloud2";
   }
-  if (looks_like_compressed_image(payload)) {
+  if (looks_like_compressed_image(payload, payload_size)) {
     return "sensor_msgs/msg/CompressedImage";
   }
-  if (looks_like_imu(payload)) {
+  if (looks_like_imu(payload, payload_size)) {
     return "sensor_msgs/msg/Imu";
   }
-  if (looks_like_odometry(payload)) {
+  if (looks_like_odometry(payload, payload_size)) {
     return "nav_msgs/msg/Odometry";
   }
-  if (looks_like_unirtk_pvh(payload)) {
+  if (looks_like_unirtk_pvh(payload, payload_size)) {
     return "robots_dog_msgs/msg/UniRtkPvh";
   }
   return "";
@@ -568,6 +571,15 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
   return cli;
 }
 
+int declare_positive_int_parameter(
+  rclcpp::Node & node, const std::string & name, int default_value)
+{
+  const auto value =
+    node.declare_parameter<int64_t>(name, static_cast<int64_t>(default_value));
+  return static_cast<int>(std::clamp<int64_t>(
+      value, 1, static_cast<int64_t>(std::numeric_limits<int>::max())));
+}
+
 void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg);
 
 }  // namespace
@@ -580,10 +592,9 @@ public:
     endpoint_(declare_parameter<std::string>("endpoint", cli.endpoint)),
     key_expr_(declare_parameter<std::string>("key_expr", cli.key_expr)),
     strip_prefix_(declare_parameter<std::string>("strip_prefix", cli.strip_prefix)),
-    max_queue_depth_(std::max<int>(
-      1, static_cast<int>(declare_parameter<int>("max_queue_depth", cli.max_queue_depth)))),
-    qos_depth_(std::max<int>(
-      1, static_cast<int>(declare_parameter<int>("qos_depth", cli.qos_depth)))),
+    max_queue_depth_(
+      declare_positive_int_parameter(*this, "max_queue_depth", cli.max_queue_depth)),
+    qos_depth_(declare_positive_int_parameter(*this, "qos_depth", cli.qos_depth)),
     reliable_(declare_parameter<bool>("reliable", cli.reliable)),
     verbose_(declare_parameter<bool>("verbose", cli.verbose))
   {
@@ -620,29 +631,49 @@ public:
 
   ~UeZenohBridgeNode() override
   {
+    // Stop Zenoh callbacks before stopping the worker so no sample can be
+    // enqueued after the worker has exited.
+    close_zenoh();
     running_.store(false);
     queue_cv_.notify_all();
     if (worker_.joinable()) {
       worker_.join();
     }
-
-    close_zenoh();
   }
 
   void enqueue(ZenohSample sample)
   {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      if (queue_.size() >= static_cast<std::size_t>(max_queue_depth_)) {
-        ++dropped_samples_;
-        if (dropped_samples_ == 1 || dropped_samples_ % 100 == 0) {
+      const auto existing = pending_samples_.find(sample.key);
+      if (existing != pending_samples_.end()) {
+        // Sensor data is time-sensitive: while a frame is waiting, only the
+        // newest frame for that key is useful.
+        existing->second = std::move(sample);
+        ++coalesced_samples_;
+        if (coalesced_samples_ == 1 || coalesced_samples_ % 100 == 0) {
           RCLCPP_WARN(
-            get_logger(), "Zenoh bridge queue full, dropped %zu samples",
-            dropped_samples_.load());
+            get_logger(), "Zenoh bridge replaced %zu stale samples with newer samples",
+            coalesced_samples_.load());
         }
         return;
       }
-      queue_.push_back(std::move(sample));
+
+      if (pending_keys_.size() >= static_cast<std::size_t>(max_queue_depth_)) {
+        const std::string oldest_key = std::move(pending_keys_.front());
+        pending_keys_.pop_front();
+        pending_samples_.erase(oldest_key);
+        ++dropped_samples_;
+        if (dropped_samples_ == 1 || dropped_samples_ % 100 == 0) {
+          RCLCPP_WARN(
+            get_logger(), "Zenoh bridge queue full, discarded %zu oldest samples",
+            dropped_samples_.load());
+        }
+      }
+
+      const std::string key = sample.key;
+      pending_samples_.emplace(key, std::move(sample));
+      pending_keys_.push_back(key);
     }
     queue_cv_.notify_one();
   }
@@ -724,25 +755,15 @@ private:
       ZenohSample sample;
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this]() { return !running_.load() || !queue_.empty(); });
-        if (!running_.load() && queue_.empty()) {
+        queue_cv_.wait(lock, [this]() { return !running_.load() || !pending_keys_.empty(); });
+        if (!running_.load()) {
           break;
         }
-        sample = std::move(queue_.front());
-        queue_.pop_front();
-      }
-      publish_sample(sample);
-    }
-
-    while (true) {
-      ZenohSample sample;
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (queue_.empty()) {
-          break;
-        }
-        sample = std::move(queue_.front());
-        queue_.pop_front();
+        const std::string key = std::move(pending_keys_.front());
+        pending_keys_.pop_front();
+        auto sample_it = pending_samples_.find(key);
+        sample = std::move(sample_it->second);
+        pending_samples_.erase(sample_it);
       }
       publish_sample(sample);
     }
@@ -750,12 +771,13 @@ private:
 
   void publish_sample(const ZenohSample & sample)
   {
-    if (sample.payload.empty()) {
+    const auto & serialized = sample.payload.get_rcl_serialized_message();
+    if (serialized.buffer_length == 0) {
       return;
     }
 
     const std::string topic = topic_from_key(sample.key, strip_prefix_);
-    std::string type = resolve_type(sample.key, topic, sample.payload);
+    std::string type = resolve_type(sample.key, topic, serialized.buffer, serialized.buffer_length);
     if (type.empty()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -769,17 +791,12 @@ private:
       return;
     }
 
-    rclcpp::SerializedMessage serialized(sample.payload.size());
-    auto & ros_msg = serialized.get_rcl_serialized_message();
-    std::memcpy(ros_msg.buffer, sample.payload.data(), sample.payload.size());
-    ros_msg.buffer_length = sample.payload.size();
-
     try {
-      pub->publish(serialized);
+      pub->publish(sample.payload);
       if (verbose_) {
         RCLCPP_INFO(
           get_logger(), "published %zu bytes: %s -> %s [%s]",
-          sample.payload.size(), sample.key.c_str(), topic.c_str(), type.c_str());
+          serialized.buffer_length, sample.key.c_str(), topic.c_str(), type.c_str());
       }
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(
@@ -789,7 +806,8 @@ private:
   }
 
   std::string resolve_type(
-    const std::string & key, const std::string & topic, const std::vector<uint8_t> & payload) const
+    const std::string & key, const std::string & topic, const uint8_t * payload,
+    std::size_t payload_size)
   {
     if (const auto it = type_overrides_.find(key); it != type_overrides_.end()) {
       return it->second;
@@ -798,16 +816,24 @@ private:
       return it->second;
     }
 
-    std::string type = detect_type_from_payload(payload);
+    if (const auto it = detected_types_.find(key); it != detected_types_.end()) {
+      return it->second;
+    }
+
+    std::string type = detect_type_from_payload(payload, payload_size);
     if (!type.empty()) {
+      detected_types_.emplace(key, type);
       return type;
     }
 
     type = default_type_for_key_or_topic(key);
-    if (!type.empty()) {
-      return type;
+    if (type.empty()) {
+      type = default_type_for_key_or_topic(topic);
     }
-    return default_type_for_key_or_topic(topic);
+    if (!type.empty()) {
+      detected_types_.emplace(key, type);
+    }
+    return type;
   }
 
   std::shared_ptr<rclcpp::GenericPublisher> get_or_create_publisher(
@@ -856,10 +882,13 @@ private:
   std::thread worker_;
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
-  std::deque<ZenohSample> queue_;
+  std::deque<std::string> pending_keys_;
+  std::unordered_map<std::string, ZenohSample> pending_samples_;
   std::atomic<std::size_t> dropped_samples_{0};
+  std::atomic<std::size_t> coalesced_samples_{0};
 
   std::unordered_map<std::string, std::string> type_overrides_;
+  std::unordered_map<std::string, std::string> detected_types_;
   std::unordered_map<std::string, std::shared_ptr<rclcpp::GenericPublisher>> publishers_;
 };
 
@@ -888,7 +917,10 @@ void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg)
     out.key.assign(key_data, key_len);
   }
   if (payload_data && payload_len > 0) {
-    out.payload.assign(payload_data, payload_data + payload_len);
+    out.payload = rclcpp::SerializedMessage(payload_len);
+    auto & serialized = out.payload.get_rcl_serialized_message();
+    std::memcpy(serialized.buffer, payload_data, payload_len);
+    serialized.buffer_length = payload_len;
   }
 
   z_drop(z_move(slice));
