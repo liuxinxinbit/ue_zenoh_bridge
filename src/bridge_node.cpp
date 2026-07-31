@@ -35,6 +35,7 @@ struct BridgeCli
   // samples for a key that is already waiting replace the older sample.
   int max_queue_depth{64};
   int qos_depth{10};
+  int worker_count{10};
   bool reliable{false};
   bool verbose{false};
 };
@@ -44,6 +45,21 @@ struct ZenohSample
   std::string key;
   rclcpp::SerializedMessage payload;
 };
+
+struct WorkerLane
+{
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::string> pending_keys;
+  std::unordered_map<std::string, ZenohSample> pending_samples;
+  std::thread thread;
+};
+
+// Up to four lanes are reserved for small real-time messages. Larger payloads
+// are assigned to the remaining lanes. Stable per-key routing preserves order
+// while preventing slow image/point-cloud publications from blocking IMU.
+constexpr std::size_t kRealtimePayloadMaxBytes = 64u * 1024u;
+constexpr std::size_t kMaxPayloadBytes = 256u * 1024u * 1024u;
 
 bool starts_with(const std::string & value, const std::string & prefix)
 {
@@ -557,6 +573,8 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
       cli.max_queue_depth = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--qos-depth", &value)) {
       cli.qos_depth = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--worker-count", &value)) {
+      cli.worker_count = std::max(1, std::stoi(value));
     } else if (args[i] == "--reliable") {
       cli.reliable = true;
     } else if (args[i] == "--best-effort") {
@@ -595,6 +613,10 @@ public:
     max_queue_depth_(
       declare_positive_int_parameter(*this, "max_queue_depth", cli.max_queue_depth)),
     qos_depth_(declare_positive_int_parameter(*this, "qos_depth", cli.qos_depth)),
+    worker_count_(
+      std::clamp(declare_positive_int_parameter(*this, "worker_count", cli.worker_count), 1, 64)),
+    lane_queue_depth_(
+      std::max(1, (max_queue_depth_ + worker_count_ - 1) / worker_count_)),
     reliable_(declare_parameter<bool>("reliable", cli.reliable)),
     verbose_(declare_parameter<bool>("verbose", cli.verbose))
   {
@@ -610,6 +632,11 @@ public:
       add_type_override(mapping);
     }
 
+    lanes_.reserve(static_cast<std::size_t>(worker_count_));
+    for (int i = 0; i < worker_count_; ++i) {
+      lanes_.push_back(std::make_unique<WorkerLane>());
+    }
+
     try {
       open_session();
       declare_subscriber();
@@ -622,11 +649,13 @@ public:
     }
 
     running_.store(true);
-    worker_ = std::thread([this]() { process_loop(); });
+    for (std::size_t i = 0; i < lanes_.size(); ++i) {
+      lanes_[i]->thread = std::thread([this, i]() { process_loop(i); });
+    }
 
     RCLCPP_INFO(
-      get_logger(), "subscribed Zenoh '%s' via endpoint '%s'",
-      key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str());
+      get_logger(), "subscribed Zenoh '%s' via endpoint '%s' with %d publish workers",
+      key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(), worker_count_);
   }
 
   ~UeZenohBridgeNode() override
@@ -635,18 +664,27 @@ public:
     // enqueued after the worker has exited.
     close_zenoh();
     running_.store(false);
-    queue_cv_.notify_all();
-    if (worker_.joinable()) {
-      worker_.join();
+    for (auto & lane : lanes_) {
+      lane->cv.notify_all();
     }
+    for (auto & lane : lanes_) {
+      if (lane->thread.joinable()) {
+        lane->thread.join();
+      }
+    }
+    RCLCPP_INFO(
+      get_logger(), "shutdown summary: coalesced=%zu, queue_dropped=%zu",
+      coalesced_samples_.load(), dropped_samples_.load());
   }
 
   void enqueue(ZenohSample sample)
   {
+    const std::size_t lane_index = lane_for(sample.key, sample.payload.size());
+    auto & lane = *lanes_[lane_index];
     {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      const auto existing = pending_samples_.find(sample.key);
-      if (existing != pending_samples_.end()) {
+      std::lock_guard<std::mutex> lock(lane.mutex);
+      const auto existing = lane.pending_samples.find(sample.key);
+      if (existing != lane.pending_samples.end()) {
         // Sensor data is time-sensitive: while a frame is waiting, only the
         // newest frame for that key is useful.
         existing->second = std::move(sample);
@@ -659,10 +697,10 @@ public:
         return;
       }
 
-      if (pending_keys_.size() >= static_cast<std::size_t>(max_queue_depth_)) {
-        const std::string oldest_key = std::move(pending_keys_.front());
-        pending_keys_.pop_front();
-        pending_samples_.erase(oldest_key);
+      if (lane.pending_keys.size() >= static_cast<std::size_t>(lane_queue_depth_)) {
+        const std::string oldest_key = std::move(lane.pending_keys.front());
+        lane.pending_keys.pop_front();
+        lane.pending_samples.erase(oldest_key);
         ++dropped_samples_;
         if (dropped_samples_ == 1 || dropped_samples_ % 100 == 0) {
           RCLCPP_WARN(
@@ -672,13 +710,37 @@ public:
       }
 
       const std::string key = sample.key;
-      pending_samples_.emplace(key, std::move(sample));
-      pending_keys_.push_back(key);
+      lane.pending_samples.emplace(key, std::move(sample));
+      lane.pending_keys.push_back(key);
     }
-    queue_cv_.notify_one();
+    lane.cv.notify_one();
   }
 
 private:
+  std::size_t lane_for(const std::string & key, std::size_t payload_size)
+  {
+    if (lanes_.size() == 1) {
+      return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(route_mutex_);
+    const auto existing = key_lanes_.find(key);
+    if (existing != key_lanes_.end()) {
+      return existing->second;
+    }
+
+    const std::size_t realtime_lanes = std::min<std::size_t>(4, lanes_.size() - 1);
+    std::size_t lane = 0;
+    if (payload_size <= kRealtimePayloadMaxBytes) {
+      lane = next_realtime_lane_++ % realtime_lanes;
+    } else {
+      const std::size_t bulk_lanes = lanes_.size() - realtime_lanes;
+      lane = realtime_lanes + (next_bulk_lane_++ % bulk_lanes);
+    }
+    key_lanes_.emplace(key, lane);
+    return lane;
+  }
+
   void open_session()
   {
     z_owned_config_t config;
@@ -749,21 +811,24 @@ private:
     get_or_create_publisher(topic, type);
   }
 
-  void process_loop()
+  void process_loop(std::size_t lane_index)
   {
+    auto & lane = *lanes_[lane_index];
     while (rclcpp::ok() && running_.load()) {
       ZenohSample sample;
       {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this]() { return !running_.load() || !pending_keys_.empty(); });
+        std::unique_lock<std::mutex> lock(lane.mutex);
+        lane.cv.wait(lock, [this, &lane]() {
+          return !running_.load() || !lane.pending_keys.empty();
+        });
         if (!running_.load()) {
           break;
         }
-        const std::string key = std::move(pending_keys_.front());
-        pending_keys_.pop_front();
-        auto sample_it = pending_samples_.find(key);
+        const std::string key = std::move(lane.pending_keys.front());
+        lane.pending_keys.pop_front();
+        auto sample_it = lane.pending_samples.find(key);
         sample = std::move(sample_it->second);
-        pending_samples_.erase(sample_it);
+        lane.pending_samples.erase(sample_it);
       }
       publish_sample(sample);
     }
@@ -816,12 +881,16 @@ private:
       return it->second;
     }
 
-    if (const auto it = detected_types_.find(key); it != detected_types_.end()) {
-      return it->second;
+    {
+      std::lock_guard<std::mutex> lock(type_mutex_);
+      if (const auto it = detected_types_.find(key); it != detected_types_.end()) {
+        return it->second;
+      }
     }
 
     std::string type = detect_type_from_payload(payload, payload_size);
     if (!type.empty()) {
+      std::lock_guard<std::mutex> lock(type_mutex_);
       detected_types_.emplace(key, type);
       return type;
     }
@@ -831,6 +900,7 @@ private:
       type = default_type_for_key_or_topic(topic);
     }
     if (!type.empty()) {
+      std::lock_guard<std::mutex> lock(type_mutex_);
       detected_types_.emplace(key, type);
     }
     return type;
@@ -839,6 +909,7 @@ private:
   std::shared_ptr<rclcpp::GenericPublisher> get_or_create_publisher(
     const std::string & topic, const std::string & type)
   {
+    std::lock_guard<std::mutex> lock(publisher_mutex_);
     const std::string key = topic + "|" + type;
     if (const auto it = publishers_.find(key); it != publishers_.end()) {
       return it->second;
@@ -871,6 +942,8 @@ private:
   std::string strip_prefix_;
   int max_queue_depth_;
   int qos_depth_;
+  int worker_count_;
+  int lane_queue_depth_;
   bool reliable_;
   bool verbose_;
 
@@ -879,16 +952,18 @@ private:
   std::mutex zenoh_mutex_;
 
   std::atomic<bool> running_{false};
-  std::thread worker_;
-  std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::deque<std::string> pending_keys_;
-  std::unordered_map<std::string, ZenohSample> pending_samples_;
+  std::vector<std::unique_ptr<WorkerLane>> lanes_;
+  std::mutex route_mutex_;
+  std::unordered_map<std::string, std::size_t> key_lanes_;
+  std::size_t next_realtime_lane_{0};
+  std::size_t next_bulk_lane_{0};
   std::atomic<std::size_t> dropped_samples_{0};
   std::atomic<std::size_t> coalesced_samples_{0};
 
   std::unordered_map<std::string, std::string> type_overrides_;
+  std::mutex type_mutex_;
   std::unordered_map<std::string, std::string> detected_types_;
+  std::mutex publisher_mutex_;
   std::unordered_map<std::string, std::shared_ptr<rclcpp::GenericPublisher>> publishers_;
 };
 
@@ -907,24 +982,46 @@ void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg)
   const char * key_data = z_string_data(z_loan(key_string));
   const std::size_t key_len = z_string_len(z_loan(key_string));
 
-  z_owned_slice_t slice;
-  z_bytes_to_slice(z_sample_payload(sample), &slice);
-  const uint8_t * payload_data = z_slice_data(z_loan(slice));
-  const std::size_t payload_len = z_slice_len(z_loan(slice));
-
-  ZenohSample out;
-  if (key_data && key_len > 0) {
-    out.key.assign(key_data, key_len);
+  const auto * payload = z_sample_payload(sample);
+  const std::size_t payload_len = z_bytes_len(payload);
+  if (payload_len == 0 || payload_len > kMaxPayloadBytes) {
+    RCLCPP_WARN_THROTTLE(
+      bridge->get_logger(), *bridge->get_clock(), 5000,
+      "discarding invalid Zenoh payload size: %zu bytes", payload_len);
+    return;
   }
-  if (payload_data && payload_len > 0) {
+
+  try {
+    ZenohSample out;
+    if (key_data && key_len > 0) {
+      out.key.assign(key_data, key_len);
+    }
     out.payload = rclcpp::SerializedMessage(payload_len);
     auto & serialized = out.payload.get_rcl_serialized_message();
-    std::memcpy(serialized.buffer, payload_data, payload_len);
-    serialized.buffer_length = payload_len;
-  }
 
-  z_drop(z_move(slice));
-  bridge->enqueue(std::move(out));
+    // Read fragmented Zenoh bytes directly into the ROS serialized buffer.
+    // z_bytes_to_slice() would first flatten into a second owned allocation.
+    z_bytes_reader_t reader = z_bytes_get_reader(payload);
+    const std::size_t copied =
+      z_bytes_reader_read(&reader, serialized.buffer, payload_len);
+    if (copied != payload_len || z_bytes_reader_remaining(&reader) != 0) {
+      RCLCPP_WARN_THROTTLE(
+        bridge->get_logger(), *bridge->get_clock(), 5000,
+        "failed to copy complete Zenoh payload: copied %zu of %zu bytes",
+        copied, payload_len);
+      return;
+    }
+    serialized.buffer_length = payload_len;
+    bridge->enqueue(std::move(out));
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_THROTTLE(
+      bridge->get_logger(), *bridge->get_clock(), 2000,
+      "failed to receive Zenoh sample: %s", e.what());
+  } catch (...) {
+    RCLCPP_ERROR_THROTTLE(
+      bridge->get_logger(), *bridge->get_clock(), 2000,
+      "failed to receive Zenoh sample: unknown error");
+  }
 }
 
 }  // namespace

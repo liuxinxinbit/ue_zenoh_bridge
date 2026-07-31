@@ -119,13 +119,27 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge --reliable --qos-depth 10
 
 bridge 内部 zenoh callback 到 ROS 发布线程之间使用有界“最新帧”队列，默认最多保留 64 个
 不同 key 的待发消息。同一 key 在等待发布期间只保留最新一帧；队列满时会淘汰最旧消息，避免
-过载时持续转发陈旧传感器数据：
+过载时持续转发陈旧传感器数据。
+
+默认使用 10 个发布 worker：其中最多 4 个用于小于等于 64 KiB 的 IMU、里程计和 GNSS，
+其余用于较大的图像和点云。消息按 key 稳定分配，既保持同 topic 顺序，又避免大消息的 DDS
+发布阻塞 IMU。每个 worker 都使用独立的有界最新帧队列，`max_queue_depth` 会在 worker
+之间均分，使总容量维持在配置值附近：
 
 ```bash
-ros2 run ue_zenoh_bridge ue_zenoh_bridge --max-queue-depth 64
+ros2 run ue_zenoh_bridge ue_zenoh_bridge \
+  --worker-count 10 \
+  --max-queue-depth 64
 ```
 
 对低延迟传感器转发，建议不要把该值调大；`1` 到 `64` 通常比大队列更合适。
+常见双雷达、RGB、深度、IMU、里程计和 GNSS 组合建议保持默认 10 个 worker。参数范围会限制
+在 1 到 64 之间。
+
+Zenoh payload 会通过 bytes reader 直接复制到 ROS2 serialized buffer，不再先展平到临时
+slice，因此即使 Zenoh payload 是分片存储，大消息接收路径也只需要一次显式复制。由于
+`rclcpp::GenericPublisher` 发布的是序列化 CDR，且不支持 intra-process 通信，这不是 DDS
+loaned-message 意义上的端到端零拷贝。
 
 ## 7. 验证
 
