@@ -63,6 +63,10 @@ set_property(
 install(TARGETS ue_zenoh_bridge
   DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS scripts/reliable_lidar_hz.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME reliable_lidar_hz)
+
 install(FILES "${ZENOHC_VENDOR_LIBRARY}"
   DESTINATION lib/${PROJECT_NAME})
 

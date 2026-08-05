@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "rclcpp/exceptions/exceptions.hpp"
 #include "rclcpp/generic_publisher.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/serialized_message.hpp"
@@ -36,14 +38,74 @@ struct BridgeCli
   int max_queue_depth{64};
   int qos_depth{10};
   int worker_count{10};
+  bool force_synchronous_publish{false};
+  bool force_asynchronous_publish{false};
+  bool auto_qos{true};
   bool reliable{false};
   bool verbose{false};
+};
+
+class OwnedZenohBytes
+{
+public:
+  OwnedZenohBytes()
+  {
+    z_internal_null(&bytes_);
+  }
+
+  explicit OwnedZenohBytes(const z_loaned_bytes_t * bytes)
+  {
+    z_bytes_clone(&bytes_, bytes);
+  }
+
+  OwnedZenohBytes(const OwnedZenohBytes &) = delete;
+  OwnedZenohBytes & operator=(const OwnedZenohBytes &) = delete;
+
+  OwnedZenohBytes(OwnedZenohBytes && other) noexcept
+  {
+    z_internal_null(&bytes_);
+    z_take(&bytes_, z_move(other.bytes_));
+  }
+
+  OwnedZenohBytes & operator=(OwnedZenohBytes && other) noexcept
+  {
+    if (this != &other) {
+      if (z_internal_check(bytes_)) {
+        z_drop(z_move(bytes_));
+      }
+      z_take(&bytes_, z_move(other.bytes_));
+    }
+    return *this;
+  }
+
+  ~OwnedZenohBytes()
+  {
+    if (z_internal_check(bytes_)) {
+      z_drop(z_move(bytes_));
+    }
+  }
+
+  const z_loaned_bytes_t * loan() const
+  {
+    return z_loan(bytes_);
+  }
+
+private:
+  z_owned_bytes_t bytes_;
 };
 
 struct ZenohSample
 {
   std::string key;
-  rclcpp::SerializedMessage payload;
+  OwnedZenohBytes payload;
+  std::size_t payload_size{0};
+};
+
+struct PublishRoute
+{
+  std::string topic;
+  std::string type;
+  std::shared_ptr<rclcpp::GenericPublisher> publisher;
 };
 
 struct WorkerLane
@@ -52,6 +114,10 @@ struct WorkerLane
   std::condition_variable cv;
   std::deque<std::string> pending_keys;
   std::unordered_map<std::string, ZenohSample> pending_samples;
+  // Each key is pinned to one lane, so only this lane's worker accesses these
+  // cached routes. The hot path therefore avoids global publisher-map locks
+  // and repeated topic/type string construction.
+  std::unordered_map<std::string, PublishRoute> routes;
   std::thread thread;
 };
 
@@ -575,9 +641,17 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
       cli.qos_depth = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--worker-count", &value)) {
       cli.worker_count = std::max(1, std::stoi(value));
+    } else if (args[i] == "--sync-publish") {
+      cli.force_synchronous_publish = true;
+      cli.force_asynchronous_publish = false;
+    } else if (args[i] == "--async-publish") {
+      cli.force_synchronous_publish = false;
+      cli.force_asynchronous_publish = true;
     } else if (args[i] == "--reliable") {
+      cli.auto_qos = false;
       cli.reliable = true;
     } else if (args[i] == "--best-effort") {
+      cli.auto_qos = false;
       cli.reliable = false;
     } else if (args[i] == "--verbose") {
       cli.verbose = true;
@@ -617,6 +691,7 @@ public:
       std::clamp(declare_positive_int_parameter(*this, "worker_count", cli.worker_count), 1, 64)),
     lane_queue_depth_(
       std::max(1, (max_queue_depth_ + worker_count_ - 1) / worker_count_)),
+    auto_qos_(declare_parameter<bool>("auto_qos", cli.auto_qos)),
     reliable_(declare_parameter<bool>("reliable", cli.reliable)),
     verbose_(declare_parameter<bool>("verbose", cli.verbose))
   {
@@ -656,6 +731,10 @@ public:
     RCLCPP_INFO(
       get_logger(), "subscribed Zenoh '%s' via endpoint '%s' with %d publish workers",
       key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(), worker_count_);
+    const char * publication_mode = std::getenv("RMW_FASTRTPS_PUBLICATION_MODE");
+    RCLCPP_INFO(
+      get_logger(), "RMW '%s', Fast DDS publication mode '%s'",
+      rmw_get_implementation_identifier(), publication_mode ? publication_mode : "<default>");
   }
 
   ~UeZenohBridgeNode() override
@@ -673,13 +752,17 @@ public:
       }
     }
     RCLCPP_INFO(
-      get_logger(), "shutdown summary: coalesced=%zu, queue_dropped=%zu",
-      coalesced_samples_.load(), dropped_samples_.load());
+      get_logger(),
+      "shutdown summary: received=%zu, published=%zu, coalesced=%zu, queue_dropped=%zu, "
+      "borrowed=%zu, fragmented_copies=%zu",
+      received_samples_.load(), published_samples_.load(), coalesced_samples_.load(),
+      dropped_samples_.load(), borrowed_publishes_.load(), fragmented_copies_.load());
   }
 
   void enqueue(ZenohSample sample)
   {
-    const std::size_t lane_index = lane_for(sample.key, sample.payload.size());
+    ++received_samples_;
+    const std::size_t lane_index = lane_for(sample.key, sample.payload_size);
     auto & lane = *lanes_[lane_index];
     {
       std::lock_guard<std::mutex> lock(lane.mutex);
@@ -814,6 +897,10 @@ private:
   void process_loop(std::size_t lane_index)
   {
     auto & lane = *lanes_[lane_index];
+    // Fragmented Zenoh payloads need one flattening copy. Keep that allocation
+    // for the lifetime of the lane instead of allocating a point-cloud-sized
+    // buffer for every frame.
+    rclcpp::SerializedMessage scratch;
     while (rclcpp::ok() && running_.load()) {
       ZenohSample sample;
       {
@@ -830,43 +917,132 @@ private:
         sample = std::move(sample_it->second);
         lane.pending_samples.erase(sample_it);
       }
-      publish_sample(sample);
+      publish_sample(sample, lane, scratch);
     }
   }
 
-  void publish_sample(const ZenohSample & sample)
+  const uint8_t * contiguous_payload(const ZenohSample & sample) const
   {
-    const auto & serialized = sample.payload.get_rcl_serialized_message();
-    if (serialized.buffer_length == 0) {
-      return;
+    auto iterator = z_bytes_get_slice_iterator(sample.payload.loan());
+    z_view_slice_t slice;
+    if (!z_bytes_slice_iterator_next(&iterator, &slice)) {
+      return nullptr;
+    }
+    const auto * loaned_slice = z_loan(slice);
+    if (z_slice_len(loaned_slice) != sample.payload_size) {
+      return nullptr;
+    }
+    return z_slice_data(loaned_slice);
+  }
+
+  const uint8_t * materialize_payload(
+    const ZenohSample & sample, rclcpp::SerializedMessage & scratch)
+  {
+    if (scratch.capacity() < sample.payload_size) {
+      scratch.reserve(sample.payload_size);
+    }
+    auto & serialized = scratch.get_rcl_serialized_message();
+    z_bytes_reader_t reader = z_bytes_get_reader(sample.payload.loan());
+    const std::size_t copied =
+      z_bytes_reader_read(&reader, serialized.buffer, sample.payload_size);
+    if (copied != sample.payload_size || z_bytes_reader_remaining(&reader) != 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "failed to copy complete Zenoh payload: copied %zu of %zu bytes",
+        copied, sample.payload_size);
+      serialized.buffer_length = 0;
+      return nullptr;
+    }
+    serialized.buffer_length = sample.payload_size;
+    ++fragmented_copies_;
+    return serialized.buffer;
+  }
+
+  PublishRoute * resolve_route(
+    const ZenohSample & sample, WorkerLane & lane, const uint8_t * data)
+  {
+    if (const auto it = lane.routes.find(sample.key); it != lane.routes.end()) {
+      return &it->second;
     }
 
     const std::string topic = topic_from_key(sample.key, strip_prefix_);
-    std::string type = resolve_type(sample.key, topic, serialized.buffer, serialized.buffer_length);
+    std::string type = resolve_type(sample.key, topic, data, sample.payload_size);
     if (type.empty()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "no ROS type mapping for Zenoh key '%s' -> topic '%s'; use --topic-type %s:=TYPE",
         sample.key.c_str(), topic.c_str(), sample.key.c_str());
-      return;
+      return nullptr;
     }
 
     auto pub = get_or_create_publisher(topic, type);
     if (!pub) {
+      return nullptr;
+    }
+
+    const auto [it, inserted] = lane.routes.emplace(
+      sample.key, PublishRoute{topic, type, std::move(pub)});
+    (void)inserted;
+    return &it->second;
+  }
+
+  void publish_borrowed(
+    const std::shared_ptr<rclcpp::GenericPublisher> & publisher,
+    const uint8_t * data, std::size_t size)
+  {
+    rcl_serialized_message_t serialized = rmw_get_zero_initialized_serialized_message();
+    serialized.buffer = const_cast<uint8_t *>(data);
+    serialized.buffer_length = size;
+    serialized.buffer_capacity = size;
+    serialized.allocator = rcl_get_default_allocator();
+    const rcl_ret_t rc = rcl_publish_serialized_message(
+      publisher->get_publisher_handle().get(), &serialized, nullptr);
+    if (rc != RCL_RET_OK) {
+      rclcpp::exceptions::throw_from_rcl_error(rc, "failed to publish serialized message");
+    }
+  }
+
+  void publish_sample(
+    const ZenohSample & sample, WorkerLane & lane, rclcpp::SerializedMessage & scratch)
+  {
+    if (sample.payload_size == 0) {
+      return;
+    }
+
+    const uint8_t * data = contiguous_payload(sample);
+    const bool borrowed = data != nullptr;
+    if (!borrowed) {
+      data = materialize_payload(sample, scratch);
+      if (!data) {
+        return;
+      }
+    }
+
+    PublishRoute * route = resolve_route(sample, lane, data);
+    if (!route) {
       return;
     }
 
     try {
-      pub->publish(sample.payload);
+      if (borrowed) {
+        // The shallow-cloned Zenoh Bytes object keeps this slice alive until
+        // the synchronous rcl publish call returns. DDS may still copy it.
+        publish_borrowed(route->publisher, data, sample.payload_size);
+        ++borrowed_publishes_;
+      } else {
+        route->publisher->publish(scratch);
+      }
+      ++published_samples_;
       if (verbose_) {
         RCLCPP_INFO(
           get_logger(), "published %zu bytes: %s -> %s [%s]",
-          serialized.buffer_length, sample.key.c_str(), topic.c_str(), type.c_str());
+          sample.payload_size, sample.key.c_str(), route->topic.c_str(), route->type.c_str());
       }
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "failed to publish '%s' as '%s': %s", topic.c_str(), type.c_str(), e.what());
+        "failed to publish '%s' as '%s': %s",
+        route->topic.c_str(), route->type.c_str(), e.what());
     }
   }
 
@@ -915,8 +1091,11 @@ private:
       return it->second;
     }
 
-    rclcpp::QoS qos(rclcpp::KeepLast(std::max(1, qos_depth_)));
-    if (reliable_) {
+    const bool pointcloud = type == "sensor_msgs/msg/PointCloud2";
+    const bool use_reliable = reliable_ || (auto_qos_ && pointcloud);
+    const int depth = auto_qos_ && !pointcloud ? 1 : std::max(1, qos_depth_);
+    rclcpp::QoS qos{rclcpp::KeepLast(depth)};
+    if (use_reliable) {
       qos.reliable();
     } else {
       qos.best_effort();
@@ -926,7 +1105,9 @@ private:
     try {
       auto pub = create_generic_publisher(topic, type, qos);
       publishers_[key] = pub;
-      RCLCPP_INFO(get_logger(), "created ROS2 publisher: %s [%s]", topic.c_str(), type.c_str());
+      RCLCPP_INFO(
+        get_logger(), "created ROS2 publisher: %s [%s], qos=%s depth=%d",
+        topic.c_str(), type.c_str(), use_reliable ? "reliable" : "best_effort", depth);
       return pub;
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(
@@ -944,6 +1125,7 @@ private:
   int qos_depth_;
   int worker_count_;
   int lane_queue_depth_;
+  bool auto_qos_;
   bool reliable_;
   bool verbose_;
 
@@ -957,8 +1139,12 @@ private:
   std::unordered_map<std::string, std::size_t> key_lanes_;
   std::size_t next_realtime_lane_{0};
   std::size_t next_bulk_lane_{0};
+  std::atomic<std::size_t> received_samples_{0};
+  std::atomic<std::size_t> published_samples_{0};
   std::atomic<std::size_t> dropped_samples_{0};
   std::atomic<std::size_t> coalesced_samples_{0};
+  std::atomic<std::size_t> borrowed_publishes_{0};
+  std::atomic<std::size_t> fragmented_copies_{0};
 
   std::unordered_map<std::string, std::string> type_overrides_;
   std::mutex type_mutex_;
@@ -996,22 +1182,11 @@ void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg)
     if (key_data && key_len > 0) {
       out.key.assign(key_data, key_len);
     }
-    out.payload = rclcpp::SerializedMessage(payload_len);
-    auto & serialized = out.payload.get_rcl_serialized_message();
-
-    // Read fragmented Zenoh bytes directly into the ROS serialized buffer.
-    // z_bytes_to_slice() would first flatten into a second owned allocation.
-    z_bytes_reader_t reader = z_bytes_get_reader(payload);
-    const std::size_t copied =
-      z_bytes_reader_read(&reader, serialized.buffer, payload_len);
-    if (copied != payload_len || z_bytes_reader_remaining(&reader) != 0) {
-      RCLCPP_WARN_THROTTLE(
-        bridge->get_logger(), *bridge->get_clock(), 5000,
-        "failed to copy complete Zenoh payload: copied %zu of %zu bytes",
-        copied, payload_len);
-      return;
-    }
-    serialized.buffer_length = payload_len;
+    // Cloning Zenoh Bytes is shallow. Keep the transport buffer alive for the
+    // publish worker and return this callback immediately; this avoids a large
+    // allocation and memcpy on Zenoh's receive thread for every lidar frame.
+    out.payload = OwnedZenohBytes(payload);
+    out.payload_size = payload_len;
     bridge->enqueue(std::move(out));
   } catch (const std::exception & e) {
     RCLCPP_ERROR_THROTTLE(
@@ -1030,6 +1205,18 @@ int main(int argc, char ** argv)
 {
   std::vector<std::string> ros_arg_strings;
   const BridgeCli cli = parse_bridge_cli(argc, argv, &ros_arg_strings);
+
+  // Fast DDS defaults to synchronous publication on ROS 2 Humble. A large
+  // fragmented point cloud can then block the only worker assigned to that
+  // lidar key for hundreds of milliseconds. Use its asynchronous writer by
+  // default, while respecting an environment value explicitly set by the user.
+  if (cli.force_synchronous_publish) {
+    (void)setenv("RMW_FASTRTPS_PUBLICATION_MODE", "SYNCHRONOUS", 1);
+  } else if (cli.force_asynchronous_publish) {
+    (void)setenv("RMW_FASTRTPS_PUBLICATION_MODE", "ASYNCHRONOUS", 1);
+  } else if (std::getenv("RMW_FASTRTPS_PUBLICATION_MODE") == nullptr) {
+    (void)setenv("RMW_FASTRTPS_PUBLICATION_MODE", "ASYNCHRONOUS", 0);
+  }
 
   std::vector<char *> ros_argv;
   ros_argv.reserve(ros_arg_strings.size());
