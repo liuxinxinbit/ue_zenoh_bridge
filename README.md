@@ -1,33 +1,87 @@
-# UE Zenoh 到 ROS2 C++ Bridge 使用说明
+# UE Zenoh 到 ROS 2 C++ Bridge 使用说明
 
-这个包把 Windows/UE 通过 zenoh 发布的 ROS2 CDR payload 转发成 ROS2 topic。UE 侧的
+这个包把 Windows/UE 通过 Zenoh 发布的 ROS 2 CDR payload 转发成 ROS 2 topic。UE 侧的
 `PublishCompressedImage`、`PublishPointCloud2`、`PublishLivoxPointCloud2`、`PublishImu`
 和 `PublishUniRtkPvh` 已经在 payload 里写入了 XCDR1 little-endian 序列化字节，因此
 bridge 端使用 `rclcpp::GenericPublisher` 直接发布序列化消息，不再重复解析和拷贝成具体
 消息对象。
 
-## 1. 前置条件
+## 1. 前置条件和 Zenoh 依赖
 
-- ROS2 Humble 或更新版本
+- ROS 2 Humble 或更新版本
 - `colcon`
 - UE 端已连接到同一个 zenoh router 或 peer 网络
+- ROS 2 的 `zenoh_cpp_vendor`，或系统安装的 zenoh-c 开发包
 
-包内已经固定携带 zenoh-c 1.9.0 的头文件和 Linux x86_64 动态库。构建和运行均不读取
-系统 zenoh-c、`zenoh_cpp_vendor`、`ZENOHC_ROOT`、`ZENOH_C_ROOT` 或 UESim 源码目录。
-安装时 `libzenohc.so` 会放在 bridge 可执行文件旁边，并通过 `$ORIGIN` 强制加载。
+包内不再携带 Zenoh 头文件和动态库。CMake 优先使用当前 ROS 2 环境中的
+`zenoh_cpp_vendor`，没有该包时依次查找系统 `zenohc` CMake 包、`pkg-config` 元数据和标准
+头文件/库路径。编译结果使用所选依赖的正常运行时搜索规则，不再复制或强制加载私有
+`libzenohc.so`。
 
-当前内置二进制只支持 Linux x86_64；其他系统或架构会在 CMake 配置阶段明确报错，需在
-`ThirdParty/zenoh-c` 中加入同版本的平台库后再扩展 CMake。
+查找顺序如下：
+
+1. 当前 ROS 2 环境中的 `zenoh_cpp_vendor`
+2. 系统或 `CMAKE_PREFIX_PATH` 中的 `zenohcConfig.cmake`
+3. `PKG_CONFIG_PATH` 中的 `zenohc.pc`
+4. 标准搜索路径中的 `zenoh.h` 和 `libzenohc`
+
+构建配置日志会打印实际选择，例如：
+
+```text
+-- Using ROS 2 zenoh_cpp_vendor via target zenohc::lib
+```
+
+或：
+
+```text
+-- Using system zenoh-c via target zenohc::lib
+```
+
+### 1.1 使用 ROS 2 提供的 Zenoh（推荐）
+
+先 source 实际使用的 ROS 2 发行版，再安装对应软件包：
+
+```bash
+export ROS_DISTRO=humble  # 按实际发行版修改，例如 jazzy
+source /opt/ros/$ROS_DISTRO/setup.bash
+sudo apt update
+sudo apt install ros-${ROS_DISTRO}-zenoh-cpp-vendor
+```
+
+构建脚本不硬编码某个 ROS 2 发行版或 Zenoh 安装路径，而是使用该发行版导出的 CMake target。
+
+### 1.2 使用系统 Zenoh
+
+如果没有安装 `zenoh_cpp_vendor`，CMake 会自动回退到系统 zenoh-c。自行安装到非标准路径时，
+根据安装内容设置其中一个搜索路径：
+
+```bash
+export CMAKE_PREFIX_PATH=/path/to/zenoh/install:$CMAKE_PREFIX_PATH
+# 或者仅提供 zenohc.pc 时：
+export PKG_CONFIG_PATH=/path/to/zenoh/install/lib/pkgconfig:$PKG_CONFIG_PATH
+```
+
+如果 ROS 2 环境中已经存在 `zenoh_cpp_vendor`，但希望强制使用系统 zenoh-c，构建时增加：
+
+```bash
+colcon build --packages-select ue_zenoh_bridge \
+  --cmake-args -DCMAKE_DISABLE_FIND_PACKAGE_zenoh_cpp_vendor=TRUE
+```
+
+头文件和动态库应来自同一个 zenoh-c 安装，避免混用不同版本。
 
 ## 2. 构建
 
 在 `ros_ws` 根目录执行：
 
 ```bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/$ROS_DISTRO/setup.bash
 colcon build --packages-select ue_zenoh_bridge
 source install/setup.bash
 ```
+
+切换 ROS 2 发行版后，应使用独立的 build/install/log 目录，或先清理旧发行版的构建产物，
+避免 CMake 缓存继续引用上一发行版的头文件和动态库。
 
 ## 3. 启动
 
@@ -153,7 +207,7 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge \
 在 1 到 64 之间。
 
 Zenoh 回调只对 payload 做浅克隆并立即返回，不再在 Zenoh 接收线程中逐帧分配、复制大点云。
-发布 worker 对连续 payload 直接借用 Zenoh 缓冲区调用 ROS2 serialized publish；仅当 Zenoh
+发布 worker 对连续 payload 直接借用 Zenoh 缓冲区调用 ROS 2 serialized publish；仅当 Zenoh
 payload 由多个 slice 组成时，才通过 bytes reader 复制到每个 worker 复用的缓冲区。因此这能
 消除常见路径上的一次大消息复制，但 DDS/RMW 仍可能在发布内部复制，并不是端到端零拷贝。
 
@@ -333,12 +387,26 @@ ros2 run ue_zenoh_bridge reliable_lidar_hz /front_lidar
 
 ## 9. 常见问题
 
-### CMake 报 bundled zenoh-c 文件缺失
+### CMake 报 zenoh-c was not found
 
-确认源码包包含 `ThirdParty/zenoh-c/include/zenoh.h` 和
-`ThirdParty/zenoh-c/lib/linux-x86_64/libzenohc.so`。bridge 不会回退使用系统 zenoh-c。
+先 source 当前 ROS 2 环境并安装对应的 `zenoh_cpp_vendor`。如果使用系统 zenoh-c，确认开发包
+包含 `zenoh.h` 和 `libzenohc`，并通过 `CMAKE_PREFIX_PATH`、`PKG_CONFIG_PATH` 或标准系统
+路径使 CMake 能找到它。
 
-### ROS2 topic 看不到
+### 构建时选中了错误的 Zenoh
+
+查看 CMake 输出中的 `Using ... via target ...`。ROS 2 vendor 默认优先；需要强制使用系统版本时，
+传入 `-DCMAKE_DISABLE_FIND_PACKAGE_zenoh_cpp_vendor=TRUE`，并重新使用空的 build 目录构建。
+
+运行时还可以检查动态链接结果：
+
+```bash
+ldd install/ue_zenoh_bridge/lib/ue_zenoh_bridge/ue_zenoh_bridge | grep zenoh
+```
+
+结果应指向所选 ROS 2 或系统安装，不应指向项目源码目录。
+
+### ROS 2 topic 看不到
 
 - 确认 bridge 日志出现 `subscribed Zenoh 'rt/**' via endpoint ...`
 - 确认 UE 端 key 被 `--key-expr` 覆盖
