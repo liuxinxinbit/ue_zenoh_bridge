@@ -80,4 +80,14 @@ install(PROGRAMS scripts/reliable_lidar_hz.py
 install(FILES README.md
   DESTINATION share/${PROJECT_NAME})
 
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(pending_queue_test test/pending_queue_test.cpp)
+  target_compile_features(pending_queue_test PRIVATE cxx_std_17)
+  target_include_directories(pending_queue_test PRIVATE src)
+  add_test(NAME pending_queue_test COMMAND pending_queue_test)
+endif()
+
 ament_package()

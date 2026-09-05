@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +24,7 @@
 #include "rclcpp/generic_publisher.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/serialized_message.hpp"
+#include "pending_queue.hpp"
 
 namespace
 {
@@ -33,11 +36,14 @@ struct BridgeCli
   std::string strip_prefix{"rt"};
   std::vector<std::string> predeclare_topics;
   std::vector<std::string> topic_type_overrides;
-  // This bounds the number of distinct keys waiting for ROS publication.  New
-  // samples for a key that is already waiting replace the older sample.
+  // Small, real-time topics keep their latest sample. Point clouds use FIFO.
   int max_queue_depth{64};
-  int qos_depth{10};
+  int qos_depth{30};
   int worker_count{10};
+  int lidar_worker_count{4};
+  int lidar_queue_depth{30};
+  int max_queue_mib{512};
+  int drain_timeout_ms{10000};
   bool force_synchronous_publish{false};
   bool force_asynchronous_publish{false};
   bool auto_qos{true};
@@ -99,6 +105,15 @@ struct ZenohSample
   std::string key;
   OwnedZenohBytes payload;
   std::size_t payload_size{0};
+  std::chrono::steady_clock::time_point received_at{std::chrono::steady_clock::now()};
+};
+
+struct TopicStats
+{
+  std::size_t received{0}, published{0}, coalesced{0}, rejected{0}, failed{0};
+  std::size_t shutdown_dropped{0}, high_water{0}, in_flight{0};
+  std::size_t last_received{0}, last_published{0};
+  double max_publish_ms{0}, max_wait_ms{0};
 };
 
 struct PublishRoute
@@ -110,10 +125,12 @@ struct PublishRoute
 
 struct WorkerLane
 {
+  WorkerLane(ue_bridge::QueueBudget & budget, std::size_t max_keys, std::size_t depth)
+  : queue(budget, max_keys, depth) {}
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<std::string> pending_keys;
-  std::unordered_map<std::string, ZenohSample> pending_samples;
+  ue_bridge::PendingQueue<ZenohSample> queue;
+  std::unordered_map<std::string, TopicStats> stats;
   // Each key is pinned to one lane, so only this lane's worker accesses these
   // cached routes. The hot path therefore avoids global publisher-map locks
   // and repeated topic/type string construction.
@@ -126,6 +143,8 @@ struct WorkerLane
 // while preventing slow image/point-cloud publications from blocking IMU.
 constexpr std::size_t kRealtimePayloadMaxBytes = 64u * 1024u;
 constexpr std::size_t kMaxPayloadBytes = 256u * 1024u * 1024u;
+volatile std::sig_atomic_t stop_requested = 0;
+void request_stop(int) { stop_requested = 1; }
 
 bool starts_with(const std::string & value, const std::string & prefix)
 {
@@ -641,6 +660,14 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
       cli.qos_depth = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--worker-count", &value)) {
       cli.worker_count = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--lidar-worker-count", &value)) {
+      cli.lidar_worker_count = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--lidar-queue-depth", &value)) {
+      cli.lidar_queue_depth = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--max-queue-mib", &value)) {
+      cli.max_queue_mib = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--drain-timeout-ms", &value)) {
+      cli.drain_timeout_ms = std::max(1, std::stoi(value));
     } else if (args[i] == "--sync-publish") {
       cli.force_synchronous_publish = true;
       cli.force_asynchronous_publish = false;
@@ -691,6 +718,14 @@ public:
       std::clamp(declare_positive_int_parameter(*this, "worker_count", cli.worker_count), 1, 64)),
     lane_queue_depth_(
       std::max(1, (max_queue_depth_ + worker_count_ - 1) / worker_count_)),
+    lidar_worker_count_(std::clamp(
+      declare_positive_int_parameter(*this, "lidar_worker_count", cli.lidar_worker_count), 1, 64)),
+    lidar_queue_depth_(declare_positive_int_parameter(
+      *this, "lidar_queue_depth", cli.lidar_queue_depth)),
+    drain_timeout_ms_(declare_positive_int_parameter(
+      *this, "drain_timeout_ms", cli.drain_timeout_ms)),
+    queue_budget_(static_cast<std::size_t>(declare_positive_int_parameter(
+      *this, "max_queue_mib", cli.max_queue_mib)) * 1024u * 1024u),
     auto_qos_(declare_parameter<bool>("auto_qos", cli.auto_qos)),
     reliable_(declare_parameter<bool>("reliable", cli.reliable)),
     verbose_(declare_parameter<bool>("verbose", cli.verbose))
@@ -707,121 +742,215 @@ public:
       add_type_override(mapping);
     }
 
-    lanes_.reserve(static_cast<std::size_t>(worker_count_));
-    for (int i = 0; i < worker_count_; ++i) {
-      lanes_.push_back(std::make_unique<WorkerLane>());
+    const int total_workers = worker_count_ + lidar_worker_count_;
+    lanes_.reserve(static_cast<std::size_t>(total_workers));
+    for (int i = 0; i < total_workers; ++i) {
+      lanes_.push_back(std::make_unique<WorkerLane>(
+        queue_budget_, static_cast<std::size_t>(lane_queue_depth_),
+        static_cast<std::size_t>(lidar_queue_depth_)));
     }
 
     try {
+      for (const auto & item : param_predeclare) { predeclare_topic(item); }
       open_session();
-      declare_subscriber();
-      for (const auto & item : param_predeclare) {
-        predeclare_topic(item);
+      running_.store(true);
+      for (std::size_t i = 0; i < lanes_.size(); ++i) {
+        lanes_[i]->thread = std::thread([this, i]() { process_loop(i); });
       }
+      declare_subscriber();
+      stats_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report_stats(false); });
     } catch (...) {
-      close_zenoh();
+      stop();
       throw;
     }
 
-    running_.store(true);
-    for (std::size_t i = 0; i < lanes_.size(); ++i) {
-      lanes_[i]->thread = std::thread([this, i]() { process_loop(i); });
-    }
-
     RCLCPP_INFO(
-      get_logger(), "subscribed Zenoh '%s' via endpoint '%s' with %d publish workers",
-      key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(), worker_count_);
+      get_logger(), "subscribed Zenoh '%s' via endpoint '%s': %d general + %d lidar workers, "
+      "lidar FIFO depth=%d, shared queue budget=%d MiB",
+      key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(),
+      worker_count_, lidar_worker_count_, lidar_queue_depth_,
+      static_cast<int>(get_parameter("max_queue_mib").as_int()));
     const char * publication_mode = std::getenv("RMW_FASTRTPS_PUBLICATION_MODE");
     RCLCPP_INFO(
       get_logger(), "RMW '%s', Fast DDS publication mode '%s'",
       rmw_get_implementation_identifier(), publication_mode ? publication_mode : "<default>");
   }
 
-  ~UeZenohBridgeNode() override
+  ~UeZenohBridgeNode() override { stop(); }
+
+  // Called while the ROS context is still valid. DDS acknowledgements confirm
+  // transport delivery, not that a recorder has flushed its disk cache.
+  void stop()
   {
-    // Stop Zenoh callbacks before stopping the worker so no sample can be
-    // enqueued after the worker has exited.
-    close_zenoh();
+    if (stopped_.exchange(true)) { return; }
+    if (stats_timer_) { stats_timer_->cancel(); }
+    close_subscriber();
+    drain_deadline_ = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(drain_timeout_ms_);
     running_.store(false);
+    for (auto & lane : lanes_) { lane->cv.notify_all(); }
     for (auto & lane : lanes_) {
-      lane->cv.notify_all();
+      if (lane->thread.joinable()) { lane->thread.join(); }
     }
-    for (auto & lane : lanes_) {
-      if (lane->thread.joinable()) {
-        lane->thread.join();
+    if (rclcpp::ok()) {
+      for (const auto & entry : publishers_) {
+        const auto & pub = entry.second;
+        if (pub->get_actual_qos().reliability() != rclcpp::ReliabilityPolicy::Reliable) {
+          continue;
+        }
+        try {
+          const auto remaining = std::max(
+            std::chrono::steady_clock::duration::zero(),
+            drain_deadline_ - std::chrono::steady_clock::now());
+          if (!pub->wait_for_all_acked(remaining)) {
+            delivery_failed_.store(true);
+            RCLCPP_ERROR(get_logger(), "DDS acknowledgement timeout: %s", pub->get_topic_name());
+          }
+        } catch (const std::exception & e) {
+          delivery_failed_.store(true);
+          RCLCPP_ERROR(get_logger(), "DDS acknowledgement failed: %s", e.what());
+        }
       }
     }
+    report_stats(true);
+    close_zenoh();
     RCLCPP_INFO(
-      get_logger(),
-      "shutdown summary: received=%zu, published=%zu, coalesced=%zu, queue_dropped=%zu, "
+      get_logger(), "shutdown summary: received=%zu, published=%zu, coalesced=%zu, "
+      "queue_dropped=%zu, failed=%zu, shutdown_dropped=%zu, receive_errors=%zu, lidar_integrity=%s, "
       "borrowed=%zu, fragmented_copies=%zu",
       received_samples_.load(), published_samples_.load(), coalesced_samples_.load(),
-      dropped_samples_.load(), borrowed_publishes_.load(), fragmented_copies_.load());
+      dropped_samples_.load(), failed_samples_.load(), shutdown_dropped_.load(),
+      receive_errors_.load(), integrity_ok() ? "OK" : "FAILED", borrowed_publishes_.load(), fragmented_copies_.load());
+  }
+
+  bool integrity_ok() const { return !delivery_failed_.load(); }
+
+  void receive_error()
+  {
+    ++receive_errors_;
+    delivery_failed_.store(true);
   }
 
   void enqueue(ZenohSample sample)
   {
+    const auto assignment = lane_for(sample);
     ++received_samples_;
-    const std::size_t lane_index = lane_for(sample.key, sample.payload_size);
-    auto & lane = *lanes_[lane_index];
+    auto & lane = *lanes_[assignment.first];
+    const std::string key = sample.key;
+    const bool fifo = assignment.second;
     {
       std::lock_guard<std::mutex> lock(lane.mutex);
-      const auto existing = lane.pending_samples.find(sample.key);
-      if (existing != lane.pending_samples.end()) {
-        // Sensor data is time-sensitive: while a frame is waiting, only the
-        // newest frame for that key is useful.
-        existing->second = std::move(sample);
-        ++coalesced_samples_;
-        if (coalesced_samples_ == 1 || coalesced_samples_ % 100 == 0) {
-          RCLCPP_WARN(
-            get_logger(), "Zenoh bridge replaced %zu stale samples with newer samples",
-            coalesced_samples_.load());
+      auto & stats = lane.stats[key];
+      ++stats.received;
+      ue_bridge::PushResult result;
+      try {
+        result = lane.queue.push(std::move(sample), fifo);
+      } catch (...) {
+        ++stats.failed;
+        ++failed_samples_;
+        throw;
+      }
+      if (result == ue_bridge::PushResult::full) {
+        ++stats.rejected;
+        ++dropped_samples_;
+        if (fifo) { delivery_failed_.store(true); }
+        if (stats.rejected == 1 || stats.rejected % 100 == 0) {
+          RCLCPP_ERROR(
+            get_logger(), "queue overflow: key=%s rejected=%zu policy=%s; "
+            "recording cannot be complete if lidar frames are rejected",
+            key.c_str(), stats.rejected, fifo ? "FIFO" : "latest");
         }
         return;
       }
-
-      if (lane.pending_keys.size() >= static_cast<std::size_t>(lane_queue_depth_)) {
-        const std::string oldest_key = std::move(lane.pending_keys.front());
-        lane.pending_keys.pop_front();
-        lane.pending_samples.erase(oldest_key);
-        ++dropped_samples_;
-        if (dropped_samples_ == 1 || dropped_samples_ % 100 == 0) {
-          RCLCPP_WARN(
-            get_logger(), "Zenoh bridge queue full, discarded %zu oldest samples",
-            dropped_samples_.load());
-        }
+      if (result == ue_bridge::PushResult::replaced) {
+        ++stats.coalesced;
+        ++coalesced_samples_;
       }
-
-      const std::string key = sample.key;
-      lane.pending_samples.emplace(key, std::move(sample));
-      lane.pending_keys.push_back(key);
+      stats.high_water = std::max(stats.high_water, lane.queue.depth(key));
     }
     lane.cv.notify_one();
   }
 
 private:
-  std::size_t lane_for(const std::string & key, std::size_t payload_size)
+  std::pair<std::size_t, bool> lane_for(const ZenohSample & sample)
   {
-    if (lanes_.size() == 1) {
-      return 0;
-    }
-
     std::lock_guard<std::mutex> lock(route_mutex_);
-    const auto existing = key_lanes_.find(key);
-    if (existing != key_lanes_.end()) {
-      return existing->second;
-    }
+    const auto existing = key_lanes_.find(sample.key);
+    if (existing != key_lanes_.end()) { return existing->second; }
 
-    const std::size_t realtime_lanes = std::min<std::size_t>(4, lanes_.size() - 1);
+    // Resolve only the first sample of a key. Payload detection prevents a
+    // /front_lidar/imu name from being mistaken for a PointCloud2 topic.
+    rclcpp::SerializedMessage scratch;
+    const uint8_t * data = contiguous_payload(sample);
+    if (!data) { data = materialize_payload(sample, scratch); }
+    const std::string topic = topic_from_key(sample.key, strip_prefix_);
+    const std::string type = resolve_type(sample.key, topic, data, sample.payload_size);
+    const bool fifo = type == "sensor_msgs/msg/PointCloud2";
     std::size_t lane = 0;
-    if (payload_size <= kRealtimePayloadMaxBytes) {
-      lane = next_realtime_lane_++ % realtime_lanes;
-    } else {
-      const std::size_t bulk_lanes = lanes_.size() - realtime_lanes;
-      lane = realtime_lanes + (next_bulk_lane_++ % bulk_lanes);
+    if (fifo) {
+      if (next_lidar_lane_ >= static_cast<std::size_t>(lidar_worker_count_)) {
+        RCLCPP_WARN(get_logger(), "more lidar keys than lidar workers; %s shares a FIFO lane; "
+          "increase --lidar-worker-count for isolation", sample.key.c_str());
+      }
+      lane = static_cast<std::size_t>(worker_count_) +
+        next_lidar_lane_++ % static_cast<std::size_t>(lidar_worker_count_);
+    } else if (worker_count_ > 1) {
+      const auto realtime_lanes = std::min<std::size_t>(4, worker_count_ - 1);
+      if (sample.payload_size <= kRealtimePayloadMaxBytes) {
+        lane = next_realtime_lane_++ % realtime_lanes;
+      } else {
+        lane = realtime_lanes + next_bulk_lane_++ % (worker_count_ - realtime_lanes);
+      }
     }
-    key_lanes_.emplace(key, lane);
-    return lane;
+    key_lanes_.emplace(sample.key, std::make_pair(lane, fifo));
+    RCLCPP_INFO(get_logger(), "route: key=%s lane=%zu queue=%s type=%s",
+      sample.key.c_str(), lane, fifo ? "FIFO" : "latest", type.c_str());
+    return {lane, fifo};
+  }
+
+  void report_stats(bool final)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::max(0.000001,
+      std::chrono::duration<double>(now - last_stats_at_).count());
+    last_stats_at_ = now;
+    struct Snapshot {
+      std::string key;
+      TopicStats stats;
+      std::size_t queued;
+      double oldest_ms;
+    };
+    for (auto & lane : lanes_) {
+      std::vector<Snapshot> snapshots;
+      {
+        std::lock_guard<std::mutex> lock(lane->mutex);
+        for (auto & entry : lane->stats) {
+          auto & st = entry.second;
+          const auto * oldest = lane->queue.front(entry.first);
+          const double oldest_ms = oldest ?
+            std::chrono::duration<double, std::milli>(now - oldest->received_at).count() : 0;
+          snapshots.push_back({entry.first, st, lane->queue.depth(entry.first), oldest_ms});
+          st.last_received = st.received;
+          st.last_published = st.published;
+          st.max_wait_ms = 0;
+          st.max_publish_ms = 0;
+        }
+      }
+      // Console/disk logging must not hold a mutex needed by Zenoh callbacks.
+      for (const auto & snapshot : snapshots) {
+        const auto & st = snapshot.stats;
+        RCLCPP_INFO(get_logger(),
+          "%s key=%s rx_hz=%.2f pub_hz=%.2f received=%zu published=%zu "
+          "queued=%zu in_flight=%zu high_water=%zu coalesced=%zu rejected=%zu "
+          "failed=%zu shutdown_dropped=%zu oldest_ms=%.2f max_wait_ms=%.2f max_publish_ms=%.2f",
+          final ? "final_stats" : "stats", snapshot.key.c_str(),
+          (st.received - st.last_received) / seconds,
+          (st.published - st.last_published) / seconds, st.received, st.published,
+          snapshot.queued, st.in_flight, st.high_water, st.coalesced,
+          st.rejected, st.failed, st.shutdown_dropped, snapshot.oldest_ms,
+          st.max_wait_ms, st.max_publish_ms);
+      }
+    }
   }
 
   void open_session()
@@ -832,6 +961,8 @@ private:
     if (!endpoint_.empty()) {
       const std::string endpoints_json = json_endpoint_array(endpoint_);
       zc_config_insert_json5(z_loan_mut(config), "connect/endpoints", endpoints_json.c_str());
+      zc_config_insert_json5(z_loan_mut(config), "mode", "\"client\"");
+      zc_config_insert_json5(z_loan_mut(config), "scouting/multicast/enabled", "false");
     }
 
     const int rc = z_open(&session_, z_move(config), nullptr);
@@ -855,6 +986,15 @@ private:
       z_loan(session_), &subscriber_, z_loan(keyexpr), z_move(closure), nullptr);
     if (rc < 0) {
       throw std::runtime_error("z_declare_subscriber failed, rc=" + std::to_string(rc));
+    }
+  }
+
+  void close_subscriber()
+  {
+    std::lock_guard<std::mutex> lock(zenoh_mutex_);
+    if (z_internal_check(subscriber_)) {
+      z_drop(z_move(subscriber_));
+      z_internal_null(&subscriber_);
     }
   }
 
@@ -901,23 +1041,49 @@ private:
     // for the lifetime of the lane instead of allocating a point-cloud-sized
     // buffer for every frame.
     rclcpp::SerializedMessage scratch;
-    while (rclcpp::ok() && running_.load()) {
+    while (true) {
       ZenohSample sample;
       {
         std::unique_lock<std::mutex> lock(lane.mutex);
         lane.cv.wait(lock, [this, &lane]() {
-          return !running_.load() || !lane.pending_keys.empty();
+          return !running_.load() || !lane.queue.empty();
         });
-        if (!running_.load()) {
+        if (!running_.load() && (lane.queue.empty() ||
+          std::chrono::steady_clock::now() >= drain_deadline_))
+        {
+          while (!lane.queue.empty()) {
+            auto discarded = lane.queue.pop();
+            ++lane.stats[discarded.key].shutdown_dropped;
+            ++shutdown_dropped_;
+            delivery_failed_.store(true);
+          }
           break;
         }
-        const std::string key = std::move(lane.pending_keys.front());
-        lane.pending_keys.pop_front();
-        auto sample_it = lane.pending_samples.find(key);
-        sample = std::move(sample_it->second);
-        lane.pending_samples.erase(sample_it);
+        sample = lane.queue.pop();
+        ++lane.stats[sample.key].in_flight;
       }
-      publish_sample(sample, lane, scratch);
+      const auto before = std::chrono::steady_clock::now();
+      bool success = false;
+      try {
+        success = publish_sample(sample, lane, scratch);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(), "publish worker failed for %s: %s", sample.key.c_str(), e.what());
+      }
+      const auto after = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(lane.mutex);
+        auto & st = lane.stats[sample.key];
+        --st.in_flight;
+        if (success) { ++st.published; } else {
+          ++st.failed;
+          ++failed_samples_;
+          delivery_failed_.store(true);
+        }
+        st.max_wait_ms = std::max(st.max_wait_ms,
+          std::chrono::duration<double, std::milli>(before - sample.received_at).count());
+        st.max_publish_ms = std::max(st.max_publish_ms,
+          std::chrono::duration<double, std::milli>(after - before).count());
+      }
     }
   }
 
@@ -1002,11 +1168,11 @@ private:
     }
   }
 
-  void publish_sample(
+  bool publish_sample(
     const ZenohSample & sample, WorkerLane & lane, rclcpp::SerializedMessage & scratch)
   {
     if (sample.payload_size == 0) {
-      return;
+      return false;
     }
 
     const uint8_t * data = contiguous_payload(sample);
@@ -1014,13 +1180,13 @@ private:
     if (!borrowed) {
       data = materialize_payload(sample, scratch);
       if (!data) {
-        return;
+        return false;
       }
     }
 
     PublishRoute * route = resolve_route(sample, lane, data);
     if (!route) {
-      return;
+      return false;
     }
 
     try {
@@ -1038,11 +1204,13 @@ private:
           get_logger(), "published %zu bytes: %s -> %s [%s]",
           sample.payload_size, sample.key.c_str(), route->topic.c_str(), route->type.c_str());
       }
+      return true;
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "failed to publish '%s' as '%s': %s",
         route->topic.c_str(), route->type.c_str(), e.what());
+      return false;
     }
   }
 
@@ -1125,6 +1293,10 @@ private:
   int qos_depth_;
   int worker_count_;
   int lane_queue_depth_;
+  int lidar_worker_count_;
+  int lidar_queue_depth_;
+  int drain_timeout_ms_;
+  ue_bridge::QueueBudget queue_budget_;
   bool auto_qos_;
   bool reliable_;
   bool verbose_;
@@ -1134,14 +1306,23 @@ private:
   std::mutex zenoh_mutex_;
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopped_{false};
+  std::atomic<bool> delivery_failed_{false};
+  std::chrono::steady_clock::time_point drain_deadline_;
+  std::chrono::steady_clock::time_point last_stats_at_{std::chrono::steady_clock::now()};
+  rclcpp::TimerBase::SharedPtr stats_timer_;
   std::vector<std::unique_ptr<WorkerLane>> lanes_;
   std::mutex route_mutex_;
-  std::unordered_map<std::string, std::size_t> key_lanes_;
+  std::unordered_map<std::string, std::pair<std::size_t, bool>> key_lanes_;
+  std::size_t next_lidar_lane_{0};
   std::size_t next_realtime_lane_{0};
   std::size_t next_bulk_lane_{0};
   std::atomic<std::size_t> received_samples_{0};
   std::atomic<std::size_t> published_samples_{0};
   std::atomic<std::size_t> dropped_samples_{0};
+  std::atomic<std::size_t> failed_samples_{0};
+  std::atomic<std::size_t> receive_errors_{0};
+  std::atomic<std::size_t> shutdown_dropped_{0};
   std::atomic<std::size_t> coalesced_samples_{0};
   std::atomic<std::size_t> borrowed_publishes_{0};
   std::atomic<std::size_t> fragmented_copies_{0};
@@ -1171,6 +1352,7 @@ void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg)
   const auto * payload = z_sample_payload(sample);
   const std::size_t payload_len = z_bytes_len(payload);
   if (payload_len == 0 || payload_len > kMaxPayloadBytes) {
+    bridge->receive_error();
     RCLCPP_WARN_THROTTLE(
       bridge->get_logger(), *bridge->get_clock(), 5000,
       "discarding invalid Zenoh payload size: %zu bytes", payload_len);
@@ -1192,10 +1374,12 @@ void zenoh_sample_handler(z_loaned_sample_t * sample, void * arg)
     RCLCPP_ERROR_THROTTLE(
       bridge->get_logger(), *bridge->get_clock(), 2000,
       "failed to receive Zenoh sample: %s", e.what());
+    bridge->receive_error();
   } catch (...) {
     RCLCPP_ERROR_THROTTLE(
       bridge->get_logger(), *bridge->get_clock(), 2000,
       "failed to receive Zenoh sample: unknown error");
+    bridge->receive_error();
   }
 }
 
@@ -1225,14 +1409,25 @@ int main(int argc, char ** argv)
   }
   int ros_argc = static_cast<int>(ros_argv.size());
 
-  rclcpp::init(ros_argc, ros_argv.data());
+  rclcpp::init(ros_argc, ros_argv.data(), rclcpp::InitOptions{}, rclcpp::SignalHandlerOptions::None);
+  std::signal(SIGINT, request_stop);
+  std::signal(SIGTERM, request_stop);
+  int result = 0;
   try {
-    rclcpp::spin(std::make_shared<UeZenohBridgeNode>(cli));
+    auto node = std::make_shared<UeZenohBridgeNode>(cli);
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    while (!stop_requested && rclcpp::ok()) {
+      executor.spin_once(std::chrono::milliseconds(100));
+    }
+    node->stop();
+    result = node->integrity_ok() ? 0 : 2;
+    executor.remove_node(node);
   } catch (const std::exception & e) {
     RCLCPP_FATAL(rclcpp::get_logger("ue_zenoh_bridge"), "%s", e.what());
     rclcpp::shutdown();
     return 1;
   }
   rclcpp::shutdown();
-  return 0;
+  return result;
 }

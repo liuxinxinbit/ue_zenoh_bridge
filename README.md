@@ -76,7 +76,7 @@ colcon build --packages-select ue_zenoh_bridge \
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
-colcon build --packages-select ue_zenoh_bridge
+colcon build --packages-select ue_zenoh_bridge --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
@@ -159,7 +159,7 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge \
 
 ## 6. QoS 和队列
 
-默认使用自动 QoS：`PointCloud2` 使用 reliable、depth 10，避免大点云的任一 DDS 分片丢失后
+默认使用自动 QoS：`PointCloud2` 使用 reliable、depth 30，避免大点云的任一 DDS 分片丢失后
 整帧作废；图像、IMU、里程计和 GNSS 继续使用 best-effort、depth 1。启动日志会打印每个
 publisher 的实际 QoS。需要强制所有 topic 使用 best-effort：
 
@@ -187,33 +187,51 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge --sync-publish
 命令行 `--async-publish` 可显式覆盖外部环境变量并强制使用异步模式。该设置只影响 Fast DDS，
 使用其他 RMW 时会被忽略。启动日志会打印当前 RMW 和 publication mode。
 
-bridge 内部 zenoh callback 到 ROS 发布线程之间使用有界“最新帧”队列，默认最多保留 64 个
-不同 key 的待发消息。同一 key 在等待发布期间只保留最新一帧；队列满时会淘汰最旧消息，避免
-过载时持续转发陈旧传感器数据。
+bridge 默认对 `sensor_msgs/msg/PointCloud2` 使用**按 topic 保序的 FIFO**，每个雷达最多
+缓存 30 帧，不再用新帧覆盖待发旧帧。类型由首帧 CDR 或显式 `--topic-type` 确定，因此
+`/front_lidar/imu` 仍按 IMU 处理。其他传感器继续只保留每个 key 最新的待发数据。
 
-默认使用 10 个发布 worker：其中最多 4 个用于小于等于 64 KiB 的 IMU、里程计和 GNSS，
-其余用于较大的图像和点云。消息按 key 稳定分配，既保持同 topic 顺序，又避免大消息的 DDS
-发布阻塞 IMU。每个 worker 都使用独立的有界最新帧队列，`max_queue_depth` 会在 worker
-之间均分，使总容量维持在配置值附近：
+雷达有独立的发布线程池，默认 4 个线程，前 4 个雷达 key 各占一个线程；更多雷达会轮转共享，
+并打印警告。普通消息默认另有 10 个线程，雷达不会与相机争用这些发布线程。单个 topic 始终
+绑定一个线程，保证顺序；同一线程内的多个 key 轮流处理，避免饥饿。
 
 ```bash
 ros2 run ue_zenoh_bridge ue_zenoh_bridge \
-  --worker-count 10 \
-  --max-queue-depth 64
+  --async-publish \
+  --lidar-worker-count 4 \
+  --lidar-queue-depth 30 \
+  --max-queue-mib 512 \
+  --qos-depth 30
 ```
 
-对低延迟传感器转发，建议不要把该值调大；`1` 到 `64` 通常比大队列更合适。
-常见双雷达、RGB、深度、IMU、里程计和 GNSS 组合建议保持默认 10 个 worker。参数范围会限制
-在 1 到 64 之间。
+| 参数 / 同名 ROS 参数（下划线） | 默认 | 含义 |
+| --- | --- | --- |
+| `--lidar-worker-count` | 4 | 独立雷达发布线程数，1～64 |
+| `--lidar-queue-depth` | 30 | 每个雷达的待发 FIFO 帧数，不含正在发布的一帧 |
+| `--max-queue-mib` | 512 | 所有线程共享的待发 payload 字节上限，MiB |
+| `--qos-depth` | 30 | DDS 发布历史深度，独立于桥接 FIFO |
+| `--worker-count` | 10 | 非雷达发布线程数，1～64 |
+| `--max-queue-depth` | 64 | 普通线程分配待发 key 容量的基数，仍按线程向上均分；雷达线程采用相同每线程 key 上限 |
+| `--drain-timeout-ms` | 10000 | 停止后的队列排空与 DDS 确认共用预算 |
 
-Zenoh 回调只对 payload 做浅克隆并立即返回，不再在 Zenoh 接收线程中逐帧分配、复制大点云。
+512 MiB 只限制队列中的 payload 字节，不包括正在发布的帧、Zenoh 接收缓存、DDS 历史和
+录包缓存。按帧数和字节数中先达到的上限拒绝**新帧**，不挤掉 FIFO 中已接受的帧。雷达发生
+拒绝时会立即打印包含 key 的错误、把完整性状态标为失败，并在退出时返回状态码 2；不会
+重复旧帧来补出 10 Hz。持续过载无法靠有限缓存解决，必须提高处理能力或让上游暂停/重试。
+
+正常 SIGINT/SIGTERM 会先取消 Zenoh 订阅，保持 ROS 上下文有效，排空已接受的队列，再等待
+reliable DDS 确认，最后关闭连接。超过排空预算的待发帧会计入 `shutdown_dropped`。正在执行的
+一次 DDS publish 调用不能被此预算强制打断。DDS 确认不等于磁盘已经落盘，录包器必须保持运行，
+待桥接退出后再正常停止录包器并等待其刷新缓存。SIGKILL 或系统崩溃不执行上述排空流程。
+
+首帧会在 Zenoh 回调中解析类型并选择通道，分片首帧可能需要额外展开复制。后续帧的回调只对
+payload 做浅克隆和入队，不在 Zenoh 接收线程中逐帧分配、复制大点云。
 发布 worker 对连续 payload 直接借用 Zenoh 缓冲区调用 ROS 2 serialized publish；仅当 Zenoh
 payload 由多个 slice 组成时，才通过 bytes reader 复制到每个 worker 复用的缓冲区。因此这能
 消除常见路径上的一次大消息复制，但 DDS/RMW 仍可能在发布内部复制，并不是端到端零拷贝。
 
-退出时日志会输出 `received`、`published`、`coalesced`、`queue_dropped`、`borrowed` 和
-`fragmented_copies`。若运行中出现 stale sample 警告且退出时 `coalesced > 0`，说明 ROS/DDS
-发布速度低于 Zenoh 输入速度；若 `received` 本身只有约 7 Hz，则瓶颈在 UE/Zenoh 上游。
+统计字段和完整录制步骤见第 8 节。注意 `coalesced` 只应发生在非点云话题；雷达低频要结合
+逐 key 的 `rx_hz`、`pub_hz`、排队等待时间和 bag 内帧数判断。
 
 ## 7. 开发稳定的 PointCloud2 订阅程序
 
@@ -229,7 +247,7 @@ PointCloud2 通常会被 DDS 拆成大量分片。best-effort 订阅端只要丢
 | reliable | best-effort | 可以匹配，但订阅端不会请求重传，大点云可能降频 |
 | reliable | `SensorDataQoS()` | 等同 best-effort，可能出现约 7 Hz 和突发到达 |
 
-bridge 默认已经为 `sensor_msgs/msg/PointCloud2` 设置 `reliable + depth 10`，业务程序不要再用
+bridge 默认已经为 `sensor_msgs/msg/PointCloud2` 设置 `reliable + depth 30`，业务程序不要再用
 `rclcpp::SensorDataQoS()` 订阅点云。
 
 ### 7.2 C++ 订阅示例
@@ -327,8 +345,8 @@ RViz 的 PointCloud2 Display 也需要把 Reliability Policy 设置为 `Reliable
 
 ### 7.5 频率和抖动的区别
 
-bridge 是收到即转发，不会伪造或重复点云。平均 10 Hz 表示长期没有丢帧，但 UE、Zenoh、DDS
-和系统调度仍可能让单帧间隔偏离 100 ms。如果业务要求严格每 100 ms 触发一次，应在算法层用
+bridge 按源数据转发，不会伪造或重复点云。平均 10 Hz 本身不能证明没有缺帧或重复帧，
+应同时核对帧数和源时间戳/帧标识。UE、Zenoh、DDS 和系统调度仍可能让单帧间隔偏离 100 ms。如果业务要求严格每 100 ms 触发一次，应在算法层用
 固定周期 timer 读取“最新点云”；不要通过重复发布旧点云来制造表面上的 10 Hz。
 
 ## 8. 验证和故障定位
@@ -363,27 +381,84 @@ Humble 的 `ros2 topic hz` 固定使用 sensor-data best-effort QoS，不能用�
 ros2 run ue_zenoh_bridge reliable_lidar_hz /front_lidar
 ```
 
-推荐按以下顺序定位：
+桥接每 5 秒打印逐 key 的 `stats`，退出时打印 `final_stats` 和总计。`rx_hz` 和 `pub_hz`
+采用本机 steady clock 的本周期计数差；首周期含发现时间，末周期含排空时间，不能单独用来判断
+源的稳定频率。`published` 只表示 ROS publish 调用成功，不表示录包已经收到或落盘。
 
-1. 启动日志应显示 `Fast DDS publication mode 'ASYNCHRONOUS'`。
-2. `/front_lidar` publisher 日志应显示 `qos=reliable depth=10`。
-3. 使用 `reliable_lidar_hz` 测量真实 reliable 接收率。
-4. 停止 bridge，检查 shutdown summary。
-
-统计含义：
-
-| 现象 | 判断 |
+| 字段 | 判断 |
 | --- | --- |
-| `received` 本身低于目标频率 | UE、传感器或 Zenoh 上游没有稳定输入 |
-| `received == published` 且 `coalesced == 0` | bridge 完整转发，没有内部丢帧 |
-| `coalesced > 0` | ROS/DDS publish 一度慢于 Zenoh 输入，只保留了最新帧 |
-| `queue_dropped > 0` | 多 key 总负载超过 bridge 队列容量 |
-| `ros2 topic hz` 约 7 Hz，但 reliable 工具约 10 Hz | best-effort 测量造成的 DDS 分片丢失 |
-| reliable 工具也低于 10 Hz，但 bridge 完整发布 | 检查订阅主机负载、回调耗时和网络质量 |
+| `received` / `published` | 相同采集区间排空后对账 |
+| `queued` / `in_flight` / `high_water` | 当前待发、正在发布和待发峰值 |
+| `coalesced` | 非雷达最新帧替换数；雷达必须为 0 |
+| `rejected` | 帧数、key 数或全局字节预算耗尽，拒绝的新帧数 |
+| `failed` | 转换路由或发布失败数 |
+| `shutdown_dropped` | 退出排空预算耗尽后丢弃的帧数 |
+| `oldest_ms` / `max_wait_ms` | 当前最老帧等待时间 / 本周期最大排队时间 |
+| `max_publish_ms` | 本周期最慢的转换/发布调用耗时 |
 
-本项目在 1 MiB、10 Hz 点云测试中，best-effort 订阅约为 7 Hz；发布端和订阅端都使用 reliable
-后可完整接收 20/20 帧。真实 `/front_lidar` 测试中 bridge 为 `received=373, published=373`，
-没有 coalesce 或 queue drop。
+每个 key 应满足 `received = published + queued + in_flight + coalesced + rejected + failed +
+shutdown_dropped`。排空后雷达要求 `received == published`，各类丢帧均为 0；还需对账 bag。
+`lidar_integrity=OK` 表示桥接没有检测到雷达队列拒绝或交付/排空失败，不证明上游没丢帧、
+存在匹配订阅者或磁盘已经写入成功。接收错误、发布失败和 DDS 确认失败采用保守策略，也会标记失败；接收错误另计入总计的 `receive_errors`。
+
+### 完整录制双雷达
+
+先 source 工作空间。推荐先启动 bridge 并预声明点云 publisher，再启动录包，确认 recorder
+已经以 RELIABLE 匹配后，最后开始仿真器的采集。否则启动发现期间的帧不在录制范围内。
+
+```bash
+ros2 run ue_zenoh_bridge ue_zenoh_bridge \
+  --async-publish --qos-depth 30 \
+  --predeclare-topic /front_lidar:=sensor_msgs/msg/PointCloud2 \
+  --predeclare-topic /rear_lidar:=sensor_msgs/msg/PointCloud2
+```
+
+本包安装 `config/lidar_record_qos.yaml`，对前后雷达显式设置 reliable、volatile、depth=30：
+
+```bash
+ros2 bag record -s sqlite3 -o lidar_bag \
+  --qos-profile-overrides-path "$(ros2 pkg prefix ue_zenoh_bridge)/share/ue_zenoh_bridge/config/lidar_record_qos.yaml" \
+  --max-cache-size 104857600 \
+  /front_lidar /rear_lidar
+```
+
+此命令不启用压缩。更改雷达 topic 时也要更改 YAML 中的精确名称。通过
+`ros2 topic info /front_lidar --verbose` 检查 recorder 的实际订阅 QoS。按所有录制 topic 的
+`payload 大小 × Hz` 相加估算带宽；磁盘持续写入能力必须高于输入，缓存可按约 1～2 秒数据量
+调整。Humble 的缓存为双缓冲，`--max-cache-size` 指每个缓冲区，峰值可接近设置值的两倍。
+不要把录包缓存、DDS history 和桥接 FIFO 当作同一层缓存。
+
+结束时先停止仿真器产生新帧、等待在途数据抵达，再 Ctrl+C 停止 bridge，检查逐雷达
+`final_stats`；bridge 退出后再 Ctrl+C 停止 recorder。`ros2 bag info lidar_bag` 只能粗略查看
+帧数和时长，准确完整性应比较同一采集区间内的源帧标识/时间戳；不要只用回放时的 `topic hz`
+验收。可连续采集 10 分钟，检查每雷达约 6000 帧、无缺失/重复、队列无持续增长。
+
+### 回归验证
+
+```bash
+colcon test --packages-select ue_zenoh_bridge
+colcon test-result --verbose
+```
+
+`test/pending_queue_test.cpp` 覆盖 FIFO 顺序、帧数溢出、跨线程共享字节预算、最新帧替换、
+多 key 公平调度及排空释放。端到端测试需要 ROS Humble、Python zenoh 和 rosbag2，使用独立
+ROS domain 83、本机 Zenoh 端口 17447，不连接仿真器。输出目录必须不存在：
+
+```bash
+python3 test/recording_integration.py \
+  --bridge "$(ros2 pkg prefix ue_zenoh_bridge)/lib/ue_zenoh_bridge/ue_zenoh_bridge" \
+  --output /tmp/ue_bridge_recording_check
+```
+
+默认双雷达各 1 MiB、10 Hz、200 帧，再附加 20 帧突发；同时发送雷达 IMU。测试比较每帧
+序列化内容的 SHA256，要求 reliable 订阅和 SQLite bag 中的全部帧内容及顺序与源完全一致。
+可用 `--payload-mib`、`--frames`、`--burst` 增加负载；`--pause-recorder-frames 20` 可模拟录包器
+暂停 2 秒后恢复，验证缓冲和重传；修改 `--domain` / `--port` 避免冲突。
+
+2026-09-05 本机 Release 验证结果：双雷达各 1 MiB，200 帧 10 Hz + 20 帧突发，订阅与 bag 均为
+220/220；双雷达各 4 MiB，120 帧 10 Hz + 20 帧突发，录包器中途暂停 2 秒，订阅与 bag 均为
+140/140，稳定段 bag 接收率约 10.02 Hz。全部逐帧 SHA256 和顺序一致，桥接无丢帧/失败。
+这是本机合成负载测试，真实 UE、网络和全传感器负载仍应按上述完整性指标验收。
 
 ## 9. 常见问题
 

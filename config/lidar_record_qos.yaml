@@ -1,0 +1,11 @@
+/front_lidar:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 30
+
+/rear_lidar:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 30
