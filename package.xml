@@ -10,6 +10,7 @@
 
   <depend>rclcpp</depend>
   <depend>rcutils</depend>
+  <depend>zlib</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>robots_dog_msgs</depend>

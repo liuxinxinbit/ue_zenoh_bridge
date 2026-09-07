@@ -6,6 +6,35 @@
 bridge 端使用 `rclcpp::GenericPublisher` 直接发布序列化消息，不再重复解析和拷贝成具体
 消息对象。
 
+## 完整录制模式（2026-09-07）
+
+使用 `--recording-mode` 时所有 topic 采用按 key 保序 FIFO，不覆盖高频 IMU/GPS/里程计。
+普通队列每个 key 默认 `--recording-queue-depth 2048`；点云仍使用独立线程和
+`--lidar-queue-depth 30`。所有队列共享 `--max-queue-mib` 字节上限，超限拒绝新消息、
+记录 rejected 并使 data_integrity=FAILED，退出码为 2。它不能保证无限过载下不丢帧。
+
+该模式强制所有 publisher 为 reliable；IMU、Odometry 和 UniRtkPvh 的 QoS depth
+默认 `--recording-qos-depth 1024`，相机和点云仍使用 `--qos-depth`（默认 30）。
+录包器也需要 reliable 和足够的队列容量。
+
+配合 `--predeclare-topic` 和 `--wait-for-recorder-ms 20000`，bridge 会等待所有预声明
+publisher 都发现名为 rosbag2_recorder 的 reliable 订阅后才订阅原始 Zenoh 数据。
+超时明确失败；记录窗口从桥接开始接收数据算起，窗口前的上游数据不包含在录制中。
+录制期间不要重启录包器或改变其 QoS。
+
+完整录制还计算每个 topic 按发布顺序拼接的原始 CDR payload CRC32（初值 0），
+输出字段 `payload_crc32`。停桥后 final_stats 应满足 received=published、
+coalesced/rejected/failed/shutdown_dropped/queued/in_flight 全为 0。
+停包后按每个 topic 的数据库插入顺序重算 CRC32 和消息数，应与 final_stats 相同。
+CRC32 是传输一致性检查，不是密码学完整性证明；还应检查源时间戳/序号连续性。
+
+停止顺序：停止 bridge 接收并等待队列排空及 DDS 确认，再正常停止 recorder 刷新缓存，
+最后检查 metadata、数据库完整性、逐 topic 条数、CRC32 和源时间戳。
+ROS publish/DDS ACK 本身不能证明磁盘落盘。原始源端未送达 bridge 的数据只能通过
+源序号或时间戳连续性另行检查。
+
+不传 `--recording-mode` 时仍保留下面描述的旧实时预览策略（非雷达 latest）。
+
 ## 1. 前置条件和 Zenoh 依赖
 
 - ROS 2 Humble 或更新版本

@@ -1,4 +1,5 @@
 #include <zenoh.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <atomic>
@@ -36,7 +37,11 @@ struct BridgeCli
   std::string strip_prefix{"rt"};
   std::vector<std::string> predeclare_topics;
   std::vector<std::string> topic_type_overrides;
-  // Small, real-time topics keep their latest sample. Point clouds use FIFO.
+  // Recording mode preserves every topic; legacy live-view mode keeps latest.
+  bool recording_mode{false};
+  int recording_queue_depth{2048};
+  int recording_qos_depth{1024};
+  int wait_for_recorder_ms{0};
   int max_queue_depth{64};
   int qos_depth{30};
   int worker_count{10};
@@ -114,6 +119,7 @@ struct TopicStats
   std::size_t shutdown_dropped{0}, high_water{0}, in_flight{0};
   std::size_t last_received{0}, last_published{0};
   double max_publish_ms{0}, max_wait_ms{0};
+  uint32_t payload_crc32{0};
 };
 
 struct PublishRoute
@@ -674,6 +680,14 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
     } else if (args[i] == "--async-publish") {
       cli.force_synchronous_publish = false;
       cli.force_asynchronous_publish = true;
+    } else if (args[i] == "--recording-mode") {
+      cli.recording_mode = true;
+    } else if (take_arg(args, i, "--recording-queue-depth", &value)) {
+      cli.recording_queue_depth = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--recording-qos-depth", &value)) {
+      cli.recording_qos_depth = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--wait-for-recorder-ms", &value)) {
+      cli.wait_for_recorder_ms = std::max(0, std::stoi(value));
     } else if (args[i] == "--reliable") {
       cli.auto_qos = false;
       cli.reliable = true;
@@ -714,6 +728,13 @@ public:
     max_queue_depth_(
       declare_positive_int_parameter(*this, "max_queue_depth", cli.max_queue_depth)),
     qos_depth_(declare_positive_int_parameter(*this, "qos_depth", cli.qos_depth)),
+    recording_mode_(declare_parameter<bool>("recording_mode", cli.recording_mode)),
+    recording_queue_depth_(declare_positive_int_parameter(
+      *this, "recording_queue_depth", cli.recording_queue_depth)),
+    recording_qos_depth_(declare_positive_int_parameter(
+      *this, "recording_qos_depth", cli.recording_qos_depth)),
+    wait_for_recorder_ms_(static_cast<int>(std::clamp<int64_t>(declare_parameter<int64_t>(
+      "wait_for_recorder_ms", cli.wait_for_recorder_ms), 0, std::numeric_limits<int>::max()))),
     worker_count_(
       std::clamp(declare_positive_int_parameter(*this, "worker_count", cli.worker_count), 1, 64)),
     lane_queue_depth_(
@@ -747,11 +768,13 @@ public:
     for (int i = 0; i < total_workers; ++i) {
       lanes_.push_back(std::make_unique<WorkerLane>(
         queue_budget_, static_cast<std::size_t>(lane_queue_depth_),
-        static_cast<std::size_t>(lidar_queue_depth_)));
+        static_cast<std::size_t>(i < worker_count_ && recording_mode_ ?
+          recording_queue_depth_ : lidar_queue_depth_)));
     }
 
     try {
       for (const auto & item : param_predeclare) { predeclare_topic(item); }
+      wait_for_recorder();
       open_session();
       running_.store(true);
       for (std::size_t i = 0; i < lanes_.size(); ++i) {
@@ -770,6 +793,9 @@ public:
       key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(),
       worker_count_, lidar_worker_count_, lidar_queue_depth_,
       static_cast<int>(get_parameter("max_queue_mib").as_int()));
+    RCLCPP_INFO(get_logger(), "recording_mode=%s general_queue=%s depth=%d scalar_qos_depth=%d",
+      recording_mode_ ? "true" : "false", recording_mode_ ? "FIFO" : "latest",
+      recording_queue_depth_, recording_qos_depth_);
     const char * publication_mode = std::getenv("RMW_FASTRTPS_PUBLICATION_MODE");
     RCLCPP_INFO(
       get_logger(), "RMW '%s', Fast DDS publication mode '%s'",
@@ -816,7 +842,7 @@ public:
     close_zenoh();
     RCLCPP_INFO(
       get_logger(), "shutdown summary: received=%zu, published=%zu, coalesced=%zu, "
-      "queue_dropped=%zu, failed=%zu, shutdown_dropped=%zu, receive_errors=%zu, lidar_integrity=%s, "
+      "queue_dropped=%zu, failed=%zu, shutdown_dropped=%zu, receive_errors=%zu, data_integrity=%s, "
       "borrowed=%zu, fragmented_copies=%zu",
       received_samples_.load(), published_samples_.load(), coalesced_samples_.load(),
       dropped_samples_.load(), failed_samples_.load(), shutdown_dropped_.load(),
@@ -853,11 +879,11 @@ public:
       if (result == ue_bridge::PushResult::full) {
         ++stats.rejected;
         ++dropped_samples_;
-        if (fifo) { delivery_failed_.store(true); }
+        if (fifo || recording_mode_) { delivery_failed_.store(true); }
         if (stats.rejected == 1 || stats.rejected % 100 == 0) {
           RCLCPP_ERROR(
             get_logger(), "queue overflow: key=%s rejected=%zu policy=%s; "
-            "recording cannot be complete if lidar frames are rejected",
+            "recording cannot be complete when FIFO samples are rejected",
             key.c_str(), stats.rejected, fifo ? "FIFO" : "latest");
         }
         return;
@@ -885,9 +911,10 @@ private:
     if (!data) { data = materialize_payload(sample, scratch); }
     const std::string topic = topic_from_key(sample.key, strip_prefix_);
     const std::string type = resolve_type(sample.key, topic, data, sample.payload_size);
-    const bool fifo = type == "sensor_msgs/msg/PointCloud2";
+    const bool pointcloud = type == "sensor_msgs/msg/PointCloud2";
+    const bool fifo = recording_mode_ || pointcloud;
     std::size_t lane = 0;
-    if (fifo) {
+    if (pointcloud) {
       if (next_lidar_lane_ >= static_cast<std::size_t>(lidar_worker_count_)) {
         RCLCPP_WARN(get_logger(), "more lidar keys than lidar workers; %s shares a FIFO lane; "
           "increase --lidar-worker-count for isolation", sample.key.c_str());
@@ -942,13 +969,13 @@ private:
         RCLCPP_INFO(get_logger(),
           "%s key=%s rx_hz=%.2f pub_hz=%.2f received=%zu published=%zu "
           "queued=%zu in_flight=%zu high_water=%zu coalesced=%zu rejected=%zu "
-          "failed=%zu shutdown_dropped=%zu oldest_ms=%.2f max_wait_ms=%.2f max_publish_ms=%.2f",
+          "failed=%zu shutdown_dropped=%zu oldest_ms=%.2f max_wait_ms=%.2f max_publish_ms=%.2f payload_crc32=%u",
           final ? "final_stats" : "stats", snapshot.key.c_str(),
           (st.received - st.last_received) / seconds,
           (st.published - st.last_published) / seconds, st.received, st.published,
           snapshot.queued, st.in_flight, st.high_water, st.coalesced,
           st.rejected, st.failed, st.shutdown_dropped, snapshot.oldest_ms,
-          st.max_wait_ms, st.max_publish_ms);
+          st.max_wait_ms, st.max_publish_ms, st.payload_crc32);
       }
     }
   }
@@ -1032,6 +1059,44 @@ private:
       type = "sensor_msgs/msg/CompressedImage";
     }
     get_or_create_publisher(topic, type);
+  }
+
+  void wait_for_recorder()
+  {
+    if (wait_for_recorder_ms_ == 0) { return; }
+    if (publishers_.empty()) {
+      throw std::runtime_error("--wait-for-recorder-ms requires predeclared topics");
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(wait_for_recorder_ms_);
+    while (rclcpp::ok() && !stop_requested) {
+      std::string pending;
+      for (const auto & entry : publishers_) {
+        const auto & pub = entry.second;
+        bool ready = false;
+        // A robot_tf subscription alone must not open the recording gate.
+        for (const auto & info : get_subscriptions_info_by_topic(pub->get_topic_name())) {
+          if (info.node_name() == "rosbag2_recorder" &&
+            info.qos_profile().reliability() == rclcpp::ReliabilityPolicy::Reliable &&
+            pub->get_subscription_count() > 0)
+          {
+            ready = true;
+            break;
+          }
+        }
+        if (!ready) { pending += std::string(pub->get_topic_name()) + " "; }
+      }
+      if (pending.empty()) {
+        RCLCPP_INFO(get_logger(), "recorder ready: all %zu predeclared topics have reliable subscribers",
+          publishers_.size());
+        return;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("recorder discovery timed out: " + pending);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    throw std::runtime_error("stopped before recorder became ready");
   }
 
   void process_loop(std::size_t lane_index)
@@ -1198,6 +1263,14 @@ private:
       } else {
         route->publisher->publish(scratch);
       }
+      if (recording_mode_) {
+        // Ordered checksum of the exact CDR bytes accepted by ROS publication.
+        // The offline bag verifier computes the same checksum after finalization.
+        std::lock_guard<std::mutex> lock(lane.mutex);
+        auto & st = lane.stats[sample.key];
+        st.payload_crc32 = static_cast<uint32_t>(crc32(
+          st.payload_crc32, data, static_cast<uInt>(sample.payload_size)));
+      }
       ++published_samples_;
       if (verbose_) {
         RCLCPP_INFO(
@@ -1260,8 +1333,11 @@ private:
     }
 
     const bool pointcloud = type == "sensor_msgs/msg/PointCloud2";
-    const bool use_reliable = reliable_ || (auto_qos_ && pointcloud);
-    const int depth = auto_qos_ && !pointcloud ? 1 : std::max(1, qos_depth_);
+    const bool scalar = type == "sensor_msgs/msg/Imu" || type == "nav_msgs/msg/Odometry" ||
+      type == "robots_dog_msgs/msg/UniRtkPvh";
+    const bool use_reliable = recording_mode_ || reliable_ || (auto_qos_ && pointcloud);
+    const int depth = recording_mode_ ? (scalar ? recording_qos_depth_ : qos_depth_) :
+      (auto_qos_ && !pointcloud ? 1 : std::max(1, qos_depth_));
     rclcpp::QoS qos{rclcpp::KeepLast(depth)};
     if (use_reliable) {
       qos.reliable();
@@ -1291,6 +1367,10 @@ private:
   std::string strip_prefix_;
   int max_queue_depth_;
   int qos_depth_;
+  bool recording_mode_;
+  int recording_queue_depth_;
+  int recording_qos_depth_;
+  int wait_for_recorder_ms_;
   int worker_count_;
   int lane_queue_depth_;
   int lidar_worker_count_;

@@ -45,5 +45,26 @@ int main()
     check(b.push({"rear", 60, 1}, true) == PushResult::accepted, "budget reusable after pop");
   }
   check(budget.used() == 0, "destruction releases all remaining frames");
-  std::cout << "FIFO ordering, overflow, fairness, latest policy and shared byte budget: PASS\n";
+  {
+    // A batched second of all scalar sensors must be retained, in order.
+    QueueBudget recording_budget(1u << 20);
+    PendingQueue<Sample> queue(recording_budget, 4, 500);
+    for (int i = 0; i < 500; ++i) {
+      check(queue.push({"imu", 128, i}, true) == PushResult::accepted, "recording IMU FIFO");
+      if (i % 5 == 0) {
+        check(queue.push({"gps", 256, i / 5}, true) == PushResult::accepted, "recording GPS FIFO");
+        check(queue.push({"odom", 512, i / 5}, true) == PushResult::accepted, "recording odom FIFO");
+      }
+    }
+    check(queue.push({"imu", 128, 500}, true) == PushResult::full, "recording FIFO explicitly rejects overflow");
+    int imu = 0, gps = 0, odom = 0;
+    while (!queue.empty()) {
+      const auto sample = queue.pop();
+      int & next = sample.key == "imu" ? imu : (sample.key == "gps" ? gps : odom);
+      check(sample.sequence == next++, "all recording topics retain order without replacement");
+    }
+    check(imu == 500 && gps == 100 && odom == 100, "all accepted sensor samples drain exactly once");
+    check(recording_budget.used() == 0, "recording drain releases byte budget");
+  }
+  std::cout << "FIFO burst recording, overflow, fairness, legacy latest policy and shared byte budget: PASS\n";
 }
