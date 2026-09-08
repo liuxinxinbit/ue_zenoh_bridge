@@ -35,6 +35,7 @@ struct BridgeCli
   std::string endpoint{"tcp/127.0.0.1:7447"};
   std::string key_expr{"rt/**"};
   std::string strip_prefix{"rt"};
+  std::string pose_alias;
   std::vector<std::string> predeclare_topics;
   std::vector<std::string> topic_type_overrides;
   // Recording mode preserves every topic; legacy live-view mode keeps latest.
@@ -127,6 +128,7 @@ struct PublishRoute
   std::string topic;
   std::string type;
   std::shared_ptr<rclcpp::GenericPublisher> publisher;
+  std::shared_ptr<rclcpp::GenericPublisher> pose_alias;
 };
 
 struct WorkerLane
@@ -680,6 +682,8 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
     } else if (args[i] == "--async-publish") {
       cli.force_synchronous_publish = false;
       cli.force_asynchronous_publish = true;
+    } else if (take_arg(args, i, "--pose-alias", &value)) {
+      cli.pose_alias = value;
     } else if (args[i] == "--recording-mode") {
       cli.recording_mode = true;
     } else if (take_arg(args, i, "--recording-queue-depth", &value)) {
@@ -725,6 +729,7 @@ public:
     endpoint_(declare_parameter<std::string>("endpoint", cli.endpoint)),
     key_expr_(declare_parameter<std::string>("key_expr", cli.key_expr)),
     strip_prefix_(declare_parameter<std::string>("strip_prefix", cli.strip_prefix)),
+    pose_alias_(declare_parameter<std::string>("pose_alias", cli.pose_alias)),
     max_queue_depth_(
       declare_positive_int_parameter(*this, "max_queue_depth", cli.max_queue_depth)),
     qos_depth_(declare_positive_int_parameter(*this, "qos_depth", cli.qos_depth)),
@@ -1059,6 +1064,13 @@ private:
       type = "sensor_msgs/msg/CompressedImage";
     }
     get_or_create_publisher(topic, type);
+    if (is_pose_source(topic, type)) { get_or_create_publisher(pose_alias_, type); }
+  }
+
+  bool is_pose_source(const std::string & topic, const std::string & type) const
+  {
+    return !pose_alias_.empty() && type == "nav_msgs/msg/Odometry" &&
+      (topic == "/odom" || topic == "/odom/mujoco_odom");
   }
 
   void wait_for_recorder()
@@ -1211,8 +1223,13 @@ private:
       return nullptr;
     }
 
+    auto alias = is_pose_source(topic, type) ? get_or_create_publisher(pose_alias_, type) : nullptr;
+    if (is_pose_source(topic, type) && !alias) { return nullptr; }
+    if (alias && std::string(alias->get_topic_name()) == pub->get_topic_name()) {
+      throw std::runtime_error("pose alias must differ from the remapped source topic");
+    }
     const auto [it, inserted] = lane.routes.emplace(
-      sample.key, PublishRoute{topic, type, std::move(pub)});
+      sample.key, PublishRoute{topic, type, std::move(pub), std::move(alias)});
     (void)inserted;
     return &it->second;
   }
@@ -1262,6 +1279,12 @@ private:
         ++borrowed_publishes_;
       } else {
         route->publisher->publish(scratch);
+      }
+      if (route->pose_alias) {
+        // Preserve every original CDR byte and its acquisition stamp. Publish
+        // on the same FIFO worker; no timer, resampling or second ROS hop.
+        if (borrowed) { publish_borrowed(route->pose_alias, data, sample.payload_size); }
+        else { route->pose_alias->publish(scratch); }
       }
       if (recording_mode_) {
         // Ordered checksum of the exact CDR bytes accepted by ROS publication.
@@ -1365,6 +1388,7 @@ private:
   std::string endpoint_;
   std::string key_expr_;
   std::string strip_prefix_;
+  std::string pose_alias_;
   int max_queue_depth_;
   int qos_depth_;
   bool recording_mode_;
