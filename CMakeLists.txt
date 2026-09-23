@@ -10,6 +10,7 @@ find_package(rclcpp REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(rcutils REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(robots_dog_msgs REQUIRED)
 
@@ -69,7 +70,7 @@ message(STATUS "Using ${UE_ZENOHC_PROVIDER} via target ${UE_ZENOHC_TARGET}")
 add_executable(ue_zenoh_bridge src/bridge_node.cpp)
 target_compile_features(ue_zenoh_bridge PUBLIC cxx_std_17)
 target_link_libraries(ue_zenoh_bridge ${UE_ZENOHC_TARGET} ZLIB::ZLIB)
-ament_target_dependencies(ue_zenoh_bridge rclcpp rcutils sensor_msgs nav_msgs robots_dog_msgs)
+ament_target_dependencies(ue_zenoh_bridge rclcpp rcutils sensor_msgs std_msgs nav_msgs robots_dog_msgs)
 
 install(TARGETS ue_zenoh_bridge
   DESTINATION lib/${PROJECT_NAME})

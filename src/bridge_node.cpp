@@ -25,6 +25,8 @@
 #include "rclcpp/generic_publisher.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/serialized_message.hpp"
+#include "rclcpp/serialization.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "pending_queue.hpp"
 
 namespace
@@ -570,6 +572,9 @@ std::string detect_type_from_payload(const uint8_t * payload, std::size_t payloa
 
 std::string default_type_for_topic(const std::string & topic)
 {
+  if (ends_with(topic, "/dynamicinfo")) {
+    return "std_msgs/msg/String";
+  }
   if (ends_with(topic, "/image/compressed") || ends_with(topic, "/image")) {
     return "sensor_msgs/msg/CompressedImage";
   }
@@ -1272,7 +1277,31 @@ private:
     }
 
     try {
-      if (borrowed) {
+      rclcpp::SerializedMessage converted;
+      const uint8_t * published_data = data;
+      std::size_t published_size = sample.payload_size;
+      const bool dynamicinfo = ends_with(route->topic, "/dynamicinfo") ||
+        ends_with(sample.key, "/dynamicinfo");
+      const bool cdr = sample.payload_size >= 4 && data[0] == 0 &&
+        (data[1] == 0 || data[1] == 1);
+      if (dynamicinfo && route->type == "std_msgs/msg/String" && !cdr) {
+        // Groundtruth is UTF-8 JSON on Zenoh, not a serialized ROS message.
+        std_msgs::msg::String message;
+        message.data.assign(reinterpret_cast<const char *>(data), sample.payload_size);
+        rclcpp::Serialization<std_msgs::msg::String> serialization;
+        serialization.serialize_message(&message, &converted);
+        // DDS transports CDR on a four-byte boundary. Explicit zero padding
+        // makes the recording checksum stable against transport-added padding.
+        const auto length = converted.size();
+        const auto padded_length = (length + 3u) & ~std::size_t{3u};
+        converted.reserve(padded_length);
+        auto & serialized = converted.get_rcl_serialized_message();
+        std::memset(serialized.buffer + length, 0, padded_length - length);
+        serialized.buffer_length = padded_length;
+        published_data = serialized.buffer;
+        published_size = serialized.buffer_length;
+        route->publisher->publish(converted);
+      } else if (borrowed) {
         // The shallow-cloned Zenoh Bytes object keeps this slice alive until
         // the synchronous rcl publish call returns. DDS may still copy it.
         publish_borrowed(route->publisher, data, sample.payload_size);
@@ -1292,7 +1321,7 @@ private:
         std::lock_guard<std::mutex> lock(lane.mutex);
         auto & st = lane.stats[sample.key];
         st.payload_crc32 = static_cast<uint32_t>(crc32(
-          st.payload_crc32, data, static_cast<uInt>(sample.payload_size)));
+          st.payload_crc32, published_data, static_cast<uInt>(published_size)));
       }
       ++published_samples_;
       if (verbose_) {
@@ -1357,7 +1386,7 @@ private:
 
     const bool pointcloud = type == "sensor_msgs/msg/PointCloud2";
     const bool scalar = type == "sensor_msgs/msg/Imu" || type == "nav_msgs/msg/Odometry" ||
-      type == "robots_dog_msgs/msg/UniRtkPvh";
+      type == "robots_dog_msgs/msg/UniRtkPvh" || type == "std_msgs/msg/String";
     const bool use_reliable = recording_mode_ || reliable_ || (auto_qos_ && pointcloud);
     const int depth = recording_mode_ ? (scalar ? recording_qos_depth_ : qos_depth_) :
       (auto_qos_ && !pointcloud ? 1 : std::max(1, qos_depth_));

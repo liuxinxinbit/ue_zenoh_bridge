@@ -6,6 +6,9 @@
 bridge 端使用 `rclcpp::GenericPublisher` 直接发布序列化消息，不再重复解析和拷贝成具体
 消息对象。
 
+Groundtruth 的 `rt/dynamicinfo` 是 JSON 文本，bridge 会将其封装为
+`std_msgs/msg/String` 自动转发到 `/dynamicinfo`，保留 bbox、类别和速度等全部字段。
+
 ## 完整录制模式（2026-09-07）
 
 使用 `--recording-mode` 时所有 topic 采用按 key 保序 FIFO，不覆盖高频 IMU/GPS/里程计。
@@ -13,7 +16,7 @@ bridge 端使用 `rclcpp::GenericPublisher` 直接发布序列化消息，不再
 `--lidar-queue-depth 30`。所有队列共享 `--max-queue-mib` 字节上限，超限拒绝新消息、
 记录 rejected 并使 data_integrity=FAILED，退出码为 2。它不能保证无限过载下不丢帧。
 
-该模式强制所有 publisher 为 reliable；IMU、Odometry 和 UniRtkPvh 的 QoS depth
+该模式强制所有 publisher 为 reliable；IMU、Odometry、UniRtkPvh 和 String 的 QoS depth
 默认 `--recording-qos-depth 1024`，相机和点云仍使用 `--qos-depth`（默认 30）。
 录包器也需要 reliable 和足够的队列容量。
 
@@ -149,6 +152,7 @@ rt/imu                            ->  /imu
 rt/gps                            ->  /gps
 rt/odom/mujoco_odom               ->  /odom/mujoco_odom
 rt/odom/mujoco_gps                ->  /odom/mujoco_gps
+rt/dynamicinfo                    ->  /dynamicinfo
 ```
 
 收到 Zenoh payload 后，bridge 会先解析 CDR 结构自动识别 ROS 类型：
@@ -164,6 +168,14 @@ rt/odom/mujoco_gps                ->  /odom/mujoco_gps
 ```bash
 ros2 run ue_zenoh_bridge ue_zenoh_bridge --key-expr 'rt/**'
 ```
+
+Groundtruth 的 `rt/dynamicinfo` 使用 JSON 文本，bridge 自动将完整文本放入
+`std_msgs/msg/String.data`，发布到 `/dynamicinfo`，无需 `--topic-type`。
+以 `/dynamicinfo` 结尾的命名空间 key 同样支持；已序列化为 String 的 XCDR1 payload
+直接透传。可用 `ros2 topic echo /dynamicinfo` 查看，用
+`--predeclare-topic /dynamicinfo` 提前创建 publisher。
+实时模式使用 best-effort、depth 1；录制模式使用 reliable 和 `--recording-qos-depth`。
+该话题的 `payload_crc32` 校验转换后发布的 ROS CDR 字节，可与 bag 中的数据核对。
 
 仍可为非默认 key 自定义映射：
 
