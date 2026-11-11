@@ -137,6 +137,39 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge \
   --key-expr 'rt/**'
 ```
 
+### 3.1 主程序未启动或中途退出时自动等待、自动重连
+
+bridge 不要求 UE 主程序或 zenoh router 先启动。启动时若 `--endpoint` 不可达，
+不再以 `z_open failed, rc=-4` 退出，而是保持 ROS 节点运行，按 `--reconnect-period-ms`
+（默认 2000）周期重试，日志形如：
+
+```text
+[WARN] Zenoh not reachable at 'tcp/127.0.0.1:7447' (z_open/declare rc=-4, main program or router not running?); retrying every 2000 ms until it appears
+[INFO] connected to Zenoh, subscribed 'rt/**' via 'tcp/127.0.0.1:7447' after 8 attempt(s); remote nodes=1
+```
+
+运行途中主程序退出时，bridge 检测到会话不再有远端节点，会释放会话并回到搜索状态；
+主程序恢复后自动重新连接并重新订阅，已创建的 ROS publisher 和统计保持不变：
+
+```text
+[WARN] Zenoh connection to 'tcp/127.0.0.1:7447' lost (no remote nodes); dropping session and waiting for the main program to come back
+[INFO] reconnected to Zenoh, subscribed 'rt/**' via 'tcp/127.0.0.1:7447' after 8 attempt(s); remote nodes=1
+```
+
+已连接但长时间没有数据时，每 30 秒提示一次正在等待主程序发布。等待期间 Ctrl-C/SIGTERM
+仍然正常退出，返回码 0。
+
+默认永久等待。需要在限定时间内连不上就失败退出（例如 CI），使用
+`--connect-timeout-ms`（0 表示永久等待），超时返回码 1：
+
+```bash
+ros2 run ue_zenoh_bridge ue_zenoh_bridge --endpoint tcp/127.0.0.1:7447 \
+  --reconnect-period-ms 1000 --connect-timeout-ms 30000
+```
+
+对应 ROS 参数为 `reconnect_period_ms` 和 `connect_timeout_ms`。`--endpoint ""`
+的 peer 模式依靠组播发现，没有固定目标，只在会话被关闭时重建。
+
 ## 4. 默认 key 到 topic 和自动类型识别
 
 默认去掉 key 前缀 `rt/`，再在前面加 `/`。topic 名称只决定 ROS topic，不再决定传感器消息类型：

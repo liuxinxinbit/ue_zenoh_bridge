@@ -52,6 +52,10 @@ struct BridgeCli
   int lidar_queue_depth{30};
   int max_queue_mib{512};
   int drain_timeout_ms{10000};
+  // Zenoh connection supervision. The bridge never exits because the UE/router
+  // side is absent: it keeps retrying until stopped or connect_timeout_ms (>0).
+  int reconnect_period_ms{2000};
+  int connect_timeout_ms{0};
   bool force_synchronous_publish{false};
   bool force_asynchronous_publish{false};
   bool auto_qos{true};
@@ -681,6 +685,10 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
       cli.max_queue_mib = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--drain-timeout-ms", &value)) {
       cli.drain_timeout_ms = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--reconnect-period-ms", &value)) {
+      cli.reconnect_period_ms = std::max(100, std::stoi(value));
+    } else if (take_arg(args, i, "--connect-timeout-ms", &value)) {
+      cli.connect_timeout_ms = std::max(0, std::stoi(value));
     } else if (args[i] == "--sync-publish") {
       cli.force_synchronous_publish = true;
       cli.force_asynchronous_publish = false;
@@ -755,6 +763,10 @@ public:
       *this, "lidar_queue_depth", cli.lidar_queue_depth)),
     drain_timeout_ms_(declare_positive_int_parameter(
       *this, "drain_timeout_ms", cli.drain_timeout_ms)),
+    reconnect_period_ms_(std::max(100, declare_positive_int_parameter(
+      *this, "reconnect_period_ms", cli.reconnect_period_ms))),
+    connect_timeout_ms_(static_cast<int>(std::clamp<int64_t>(declare_parameter<int64_t>(
+      "connect_timeout_ms", cli.connect_timeout_ms), 0, std::numeric_limits<int>::max()))),
     queue_budget_(static_cast<std::size_t>(declare_positive_int_parameter(
       *this, "max_queue_mib", cli.max_queue_mib)) * 1024u * 1024u),
     auto_qos_(declare_parameter<bool>("auto_qos", cli.auto_qos)),
@@ -783,26 +795,35 @@ public:
     }
 
     try {
+      z_view_keyexpr_t keyexpr;
+      if (z_view_keyexpr_from_str(&keyexpr, key_expr_.c_str()) < 0) {
+        throw std::runtime_error("invalid zenoh key expression: " + key_expr_);
+      }
       for (const auto & item : param_predeclare) { predeclare_topic(item); }
       wait_for_recorder();
-      open_session();
       running_.store(true);
       for (std::size_t i = 0; i < lanes_.size(); ++i) {
         lanes_[i]->thread = std::thread([this, i]() { process_loop(i); });
       }
-      declare_subscriber();
+      // The Zenoh side (UE main program / router) may not be running yet, or
+      // may restart later. A supervisor thread owns connect/reconnect so the
+      // ROS node stays alive and keeps waiting instead of exiting.
+      supervisor_thread_ = std::thread([this]() { supervise_zenoh(); });
       stats_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report_stats(false); });
     } catch (...) {
       stop();
       throw;
     }
 
+    const std::string connect_timeout_text =
+      connect_timeout_ms_ > 0 ? std::to_string(connect_timeout_ms_) + " ms" : "none (wait forever)";
     RCLCPP_INFO(
-      get_logger(), "subscribed Zenoh '%s' via endpoint '%s': %d general + %d lidar workers, "
-      "lidar FIFO depth=%d, shared queue budget=%d MiB",
+      get_logger(), "bridge ready: Zenoh key '%s' via endpoint '%s': %d general + %d lidar workers, "
+      "lidar FIFO depth=%d, shared queue budget=%d MiB, reconnect_period=%d ms, connect_timeout=%s",
       key_expr_.c_str(), endpoint_.empty() ? "<peer/default>" : endpoint_.c_str(),
       worker_count_, lidar_worker_count_, lidar_queue_depth_,
-      static_cast<int>(get_parameter("max_queue_mib").as_int()));
+      static_cast<int>(get_parameter("max_queue_mib").as_int()), reconnect_period_ms_,
+      connect_timeout_text.c_str());
     RCLCPP_INFO(get_logger(), "recording_mode=%s general_queue=%s depth=%d scalar_qos_depth=%d",
       recording_mode_ ? "true" : "false", recording_mode_ ? "FIFO" : "latest",
       recording_queue_depth_, recording_qos_depth_);
@@ -820,6 +841,12 @@ public:
   {
     if (stopped_.exchange(true)) { return; }
     if (stats_timer_) { stats_timer_->cancel(); }
+    {
+      std::lock_guard<std::mutex> lock(supervisor_mutex_);
+      supervising_ = false;
+    }
+    supervisor_cv_.notify_all();
+    if (supervisor_thread_.joinable()) { supervisor_thread_.join(); }
     close_subscriber();
     drain_deadline_ = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(drain_timeout_ms_);
@@ -860,6 +887,8 @@ public:
   }
 
   bool integrity_ok() const { return !delivery_failed_.load(); }
+  bool connect_timed_out() const { return connect_timed_out_.load(); }
+  bool zenoh_connected() const { return zenoh_connected_.load(); }
 
   void receive_error()
   {
@@ -951,6 +980,16 @@ private:
     const double seconds = std::max(0.000001,
       std::chrono::duration<double>(now - last_stats_at_).count());
     last_stats_at_ = now;
+    const std::size_t received_now = received_samples_.load();
+    if (!final && received_now == last_stats_received_) {
+      if (zenoh_connected_.load()) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 30000,
+          "Zenoh connected, no data received in the last %.0f s; waiting for the main program "
+          "to publish '%s'", seconds, key_expr_.c_str());
+      }
+    }
+    last_stats_received_ = received_now;
     struct Snapshot {
       std::string key;
       TopicStats stats;
@@ -990,7 +1029,7 @@ private:
     }
   }
 
-  void open_session()
+  int open_session()
   {
     z_owned_config_t config;
     z_config_default(&config);
@@ -1002,27 +1041,144 @@ private:
       zc_config_insert_json5(z_loan_mut(config), "scouting/multicast/enabled", "false");
     }
 
-    const int rc = z_open(&session_, z_move(config), nullptr);
-    if (rc < 0) {
-      throw std::runtime_error("z_open failed, rc=" + std::to_string(rc));
-    }
+    // Client mode: z_open returns immediately with Z_ENETWORK (-4) when the
+    // configured endpoint is not listening. The supervisor retries it.
+    std::lock_guard<std::mutex> lock(zenoh_mutex_);
+    return z_open(&session_, z_move(config), nullptr);
   }
 
-  void declare_subscriber()
+  int declare_subscriber()
   {
     z_view_keyexpr_t keyexpr;
     if (z_view_keyexpr_from_str(&keyexpr, key_expr_.c_str()) < 0) {
-      throw std::runtime_error("invalid zenoh key expression: " + key_expr_);
+      return Z_EINVAL;
     }
 
     z_owned_closure_sample_t closure;
     z_closure(&closure, zenoh_sample_handler, nullptr, static_cast<void *>(this));
 
     std::lock_guard<std::mutex> lock(zenoh_mutex_);
-    const int rc = z_declare_subscriber(
+    return z_declare_subscriber(
       z_loan(session_), &subscriber_, z_loan(keyexpr), z_move(closure), nullptr);
-    if (rc < 0) {
-      throw std::runtime_error("z_declare_subscriber failed, rc=" + std::to_string(rc));
+  }
+
+  static void count_zid(const z_id_t *, void * context)
+  {
+    ++*static_cast<std::size_t *>(context);
+  }
+
+  // Number of routers (client mode) or peers (peer mode) currently linked to
+  // the session. Zero means the UE main program / router went away.
+  std::size_t count_remote_nodes(bool * closed)
+  {
+    std::lock_guard<std::mutex> lock(zenoh_mutex_);
+    *closed = !z_internal_check(session_) || z_session_is_closed(z_loan(session_));
+    if (*closed) { return 0; }
+    std::size_t routers = 0;
+    std::size_t peers = 0;
+    z_owned_closure_zid_t router_closure;
+    z_closure(&router_closure, count_zid, nullptr, static_cast<void *>(&routers));
+    (void)z_info_routers_zid(z_loan(session_), z_move(router_closure));
+    z_owned_closure_zid_t peer_closure;
+    z_closure(&peer_closure, count_zid, nullptr, static_cast<void *>(&peers));
+    (void)z_info_peers_zid(z_loan(session_), z_move(peer_closure));
+    return routers + peers;
+  }
+
+  // Sleeps for the reconnect period; returns false as soon as stop() is called.
+  bool supervisor_wait(std::chrono::milliseconds period)
+  {
+    std::unique_lock<std::mutex> lock(supervisor_mutex_);
+    return !supervisor_cv_.wait_for(lock, period, [this]() { return !supervising_; });
+  }
+
+  bool supervising()
+  {
+    std::lock_guard<std::mutex> lock(supervisor_mutex_);
+    return supervising_;
+  }
+
+  void supervise_zenoh()
+  {
+    const auto period = std::chrono::milliseconds(reconnect_period_ms_);
+    const auto started = std::chrono::steady_clock::now();
+    const char * target = endpoint_.empty() ? "<peer/default scouting>" : endpoint_.c_str();
+    std::size_t attempts = 0;
+    bool ever_connected = false;
+    int last_rc = 0;
+    int lost_checks = 0;
+    while (supervising()) {
+      if (!zenoh_connected_.load()) {
+        ++attempts;
+        int rc = open_session();
+        if (rc >= 0) {
+          rc = declare_subscriber();
+          if (rc < 0) { close_zenoh(); }
+        }
+        if (rc >= 0) {
+          bool closed = false;
+          const std::size_t remotes = count_remote_nodes(&closed);
+          zenoh_connected_.store(true);
+          lost_checks = 0;
+          RCLCPP_INFO(
+            get_logger(), "%s Zenoh, subscribed '%s' via '%s' after %zu attempt(s); remote nodes=%zu",
+            ever_connected ? "reconnected to" : "connected to", key_expr_.c_str(),
+            target, attempts, remotes);
+          ever_connected = true;
+          attempts = 0;
+          continue;
+        }
+        if (rc != last_rc || attempts == 1) {
+          RCLCPP_WARN(
+            get_logger(), "Zenoh not reachable at '%s' (z_open/declare rc=%d, main program or "
+            "router not running?); retrying every %d ms until it appears",
+            target, rc, reconnect_period_ms_);
+        } else {
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 30000,
+            "still waiting for Zenoh at '%s' (attempt %zu, rc=%d)", target, attempts, rc);
+        }
+        last_rc = rc;
+        if (connect_timeout_ms_ > 0 && !ever_connected &&
+          std::chrono::steady_clock::now() - started > std::chrono::milliseconds(connect_timeout_ms_))
+        {
+          RCLCPP_FATAL(
+            get_logger(), "no Zenoh connection to '%s' within %d ms; giving up",
+            target, connect_timeout_ms_);
+          connect_timed_out_.store(true);
+          stop_requested = 1;
+          return;
+        }
+        if (!supervisor_wait(period)) { return; }
+        continue;
+      }
+
+      // Connected: detect the remote side going away. In client mode the
+      // router count drops to zero; a closed session also counts as lost.
+      bool closed = false;
+      const std::size_t remotes = count_remote_nodes(&closed);
+      const bool lost = closed || (!endpoint_.empty() && remotes == 0);
+      if (lost) {
+        // One grace period avoids flapping on a momentary link hiccup that
+        // Zenoh's own client reconnection would heal by itself.
+        if (++lost_checks >= 2 || closed) {
+          RCLCPP_WARN(
+            get_logger(), "Zenoh connection to '%s' lost (%s); dropping session and waiting "
+            "for the main program to come back",
+            target, closed ? "session closed" : "no remote nodes");
+          close_zenoh();
+          zenoh_connected_.store(false);
+          last_rc = 0;
+          lost_checks = 0;
+          // Retry immediately once, then back off to the configured period.
+          continue;
+        }
+      } else {
+        lost_checks = 0;
+      }
+      if (!supervisor_wait(std::chrono::milliseconds(std::min(reconnect_period_ms_, 1000)))) {
+        return;
+      }
     }
   }
 
@@ -1429,6 +1585,8 @@ private:
   int lidar_worker_count_;
   int lidar_queue_depth_;
   int drain_timeout_ms_;
+  int reconnect_period_ms_;
+  int connect_timeout_ms_;
   ue_bridge::QueueBudget queue_budget_;
   bool auto_qos_;
   bool reliable_;
@@ -1438,11 +1596,19 @@ private:
   z_owned_subscriber_t subscriber_;
   std::mutex zenoh_mutex_;
 
+  std::thread supervisor_thread_;
+  std::mutex supervisor_mutex_;
+  std::condition_variable supervisor_cv_;
+  bool supervising_{true};
+  std::atomic<bool> zenoh_connected_{false};
+  std::atomic<bool> connect_timed_out_{false};
+
   std::atomic<bool> running_{false};
   std::atomic<bool> stopped_{false};
   std::atomic<bool> delivery_failed_{false};
   std::chrono::steady_clock::time_point drain_deadline_;
   std::chrono::steady_clock::time_point last_stats_at_{std::chrono::steady_clock::now()};
+  std::size_t last_stats_received_{0};
   rclcpp::TimerBase::SharedPtr stats_timer_;
   std::vector<std::unique_ptr<WorkerLane>> lanes_;
   std::mutex route_mutex_;
@@ -1554,7 +1720,7 @@ int main(int argc, char ** argv)
       executor.spin_once(std::chrono::milliseconds(100));
     }
     node->stop();
-    result = node->integrity_ok() ? 0 : 2;
+    result = node->connect_timed_out() ? 1 : (node->integrity_ok() ? 0 : 2);
     executor.remove_node(node);
   } catch (const std::exception & e) {
     RCLCPP_FATAL(rclcpp::get_logger("ue_zenoh_bridge"), "%s", e.what());
