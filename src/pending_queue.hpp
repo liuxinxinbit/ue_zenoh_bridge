@@ -34,6 +34,13 @@ enum class PushResult { accepted, replaced, full };
 
 // Caller holds the lane mutex. T has key and payload_size members and is movable.
 // Round-robin scheduling preserves per-key FIFO order without starving other keys.
+//
+// Policies per push:
+//   fifo=false                      keep only the newest sample of the key (latest).
+//   fifo=true                       bounded FIFO; a full key rejects the new sample.
+//   fifo=true, coalesce_when_full   bounded FIFO that absorbs worker jitter; once the
+//                                   key is full the newest queued sample is replaced
+//                                   so latency stays bounded (live view mode).
 template<typename T>
 class PendingQueue
 {
@@ -49,11 +56,13 @@ public:
     }
   }
 
-  PushResult push(T sample, bool fifo)
+  PushResult push(T sample, bool fifo, bool coalesce_when_full = false)
   {
     const std::string key = sample.key;
     auto it = topics_.find(key);
-    if (it != topics_.end() && !fifo) {
+    const bool replace_newest = it != topics_.end() &&
+      (!fifo || (coalesce_when_full && it->second.size() >= fifo_depth_));
+    if (replace_newest) {
       auto & old = it->second.back();
       const auto old_bytes = old.payload_size;
       const auto new_bytes = sample.payload_size;

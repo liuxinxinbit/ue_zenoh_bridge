@@ -36,7 +36,10 @@ CRC32 是传输一致性检查，不是密码学完整性证明；还应检查�
 ROS publish/DDS ACK 本身不能证明磁盘落盘。原始源端未送达 bridge 的数据只能通过
 源序号或时间戳连续性另行检查。
 
-不传 `--recording-mode` 时仍保留下面描述的旧实时预览策略（非雷达 latest）。
+不传 `--recording-mode` 时为实时模式：非雷达 key 使用每 key `--live-queue-depth`（默认 16）
+的小深度 FIFO，吸收发布线程的调度抖动，保持 IMU 等高频话题的原始频率；只有 FIFO 满了
+（发布线程持续慢于源）才覆盖队尾最新一条（计入 coalesced），保证实时延迟有界。
+点云在两种模式下都是严格 FIFO，满了拒绝新帧并标记完整性失败。
 
 ## 1. 前置条件和 Zenoh 依赖
 
@@ -285,6 +288,7 @@ ros2 run ue_zenoh_bridge ue_zenoh_bridge \
 | `--max-queue-mib` | 512 | 所有线程共享的待发 payload 字节上限，MiB |
 | `--qos-depth` | 30 | DDS 发布历史深度，独立于桥接 FIFO |
 | `--worker-count` | 10 | 非雷达发布线程数，1～64 |
+| `--live-queue-depth` | 16 | 实时模式下每个非雷达 key 的待发 FIFO 深度，满后覆盖队尾最新一条 |
 | `--max-queue-depth` | 64 | 普通线程分配待发 key 容量的基数，仍按线程向上均分；雷达线程采用相同每线程 key 上限 |
 | `--drain-timeout-ms` | 10000 | 停止后的队列排空与 DDS 确认共用预算 |
 

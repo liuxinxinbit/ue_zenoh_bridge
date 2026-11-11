@@ -66,5 +66,21 @@ int main()
     check(imu == 500 && gps == 100 && odom == 100, "all accepted sensor samples drain exactly once");
     check(recording_budget.used() == 0, "recording drain releases byte budget");
   }
-  std::cout << "FIFO burst recording, overflow, fairness, legacy latest policy and shared byte budget: PASS\n";
+  {
+    // Live mode: small FIFO absorbs jitter, then coalesces instead of rejecting.
+    QueueBudget live_budget(1000);
+    PendingQueue<Sample> queue(live_budget, 4, 3);
+    for (int i = 0; i < 3; ++i) {
+      check(queue.push({"imu", 10, i}, true, true) == PushResult::accepted, "live FIFO accepts up to depth");
+    }
+    check(queue.push({"imu", 10, 3}, true, true) == PushResult::replaced, "live FIFO coalesces when full");
+    check(queue.push({"imu", 10, 4}, true, true) == PushResult::replaced, "live FIFO keeps coalescing");
+    check(queue.depth("imu") == 3, "live FIFO depth stays bounded");
+    check(queue.pop().sequence == 0, "oldest live sample first");
+    check(queue.pop().sequence == 1, "second live sample");
+    check(queue.pop().sequence == 4, "newest replaced the tail");
+    check(queue.empty(), "live FIFO drained");
+    check(live_budget.used() == 0, "live budget released");
+  }
+  std::cout << "FIFO burst recording, overflow, fairness, legacy latest policy, live FIFO coalescing and shared byte budget: PASS\n";
 }

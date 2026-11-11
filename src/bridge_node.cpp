@@ -44,6 +44,9 @@ struct BridgeCli
   bool recording_mode{false};
   int recording_queue_depth{2048};
   int recording_qos_depth{1024};
+  // Live mode per-key FIFO depth for non-lidar keys. Absorbs worker jitter so
+  // 500 Hz IMU keeps its rate; when full the newest sample is coalesced.
+  int live_queue_depth{16};
   int wait_for_recorder_ms{0};
   int max_queue_depth{64};
   int qos_depth{30};
@@ -703,6 +706,8 @@ BridgeCli parse_bridge_cli(int argc, char ** argv, std::vector<std::string> * ro
       cli.recording_queue_depth = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--recording-qos-depth", &value)) {
       cli.recording_qos_depth = std::max(1, std::stoi(value));
+    } else if (take_arg(args, i, "--live-queue-depth", &value)) {
+      cli.live_queue_depth = std::max(1, std::stoi(value));
     } else if (take_arg(args, i, "--wait-for-recorder-ms", &value)) {
       cli.wait_for_recorder_ms = std::max(0, std::stoi(value));
     } else if (args[i] == "--reliable") {
@@ -751,6 +756,8 @@ public:
       *this, "recording_queue_depth", cli.recording_queue_depth)),
     recording_qos_depth_(declare_positive_int_parameter(
       *this, "recording_qos_depth", cli.recording_qos_depth)),
+    live_queue_depth_(declare_positive_int_parameter(
+      *this, "live_queue_depth", cli.live_queue_depth)),
     wait_for_recorder_ms_(static_cast<int>(std::clamp<int64_t>(declare_parameter<int64_t>(
       "wait_for_recorder_ms", cli.wait_for_recorder_ms), 0, std::numeric_limits<int>::max()))),
     worker_count_(
@@ -788,10 +795,11 @@ public:
     const int total_workers = worker_count_ + lidar_worker_count_;
     lanes_.reserve(static_cast<std::size_t>(total_workers));
     for (int i = 0; i < total_workers; ++i) {
+      const int depth = i >= worker_count_ ? lidar_queue_depth_ :
+        (recording_mode_ ? recording_queue_depth_ : live_queue_depth_);
       lanes_.push_back(std::make_unique<WorkerLane>(
         queue_budget_, static_cast<std::size_t>(lane_queue_depth_),
-        static_cast<std::size_t>(i < worker_count_ && recording_mode_ ?
-          recording_queue_depth_ : lidar_queue_depth_)));
+        static_cast<std::size_t>(depth)));
     }
 
     try {
@@ -825,8 +833,8 @@ public:
       static_cast<int>(get_parameter("max_queue_mib").as_int()), reconnect_period_ms_,
       connect_timeout_text.c_str());
     RCLCPP_INFO(get_logger(), "recording_mode=%s general_queue=%s depth=%d scalar_qos_depth=%d",
-      recording_mode_ ? "true" : "false", recording_mode_ ? "FIFO" : "latest",
-      recording_queue_depth_, recording_qos_depth_);
+      recording_mode_ ? "true" : "false", recording_mode_ ? "FIFO" : "FIFO+coalesce",
+      recording_mode_ ? recording_queue_depth_ : live_queue_depth_, recording_qos_depth_);
     const char * publication_mode = std::getenv("RMW_FASTRTPS_PUBLICATION_MODE");
     RCLCPP_INFO(
       get_logger(), "RMW '%s', Fast DDS publication mode '%s'",
@@ -902,14 +910,17 @@ public:
     ++received_samples_;
     auto & lane = *lanes_[assignment.first];
     const std::string key = sample.key;
-    const bool fifo = assignment.second;
+    // Strict keys (recording mode, point clouds) reject on overflow and mark
+    // integrity failed. Live keys coalesce the newest sample once their FIFO
+    // depth is reached, which bounds latency without dropping on mere jitter.
+    const bool strict = assignment.second;
     {
       std::lock_guard<std::mutex> lock(lane.mutex);
       auto & stats = lane.stats[key];
       ++stats.received;
       ue_bridge::PushResult result;
       try {
-        result = lane.queue.push(std::move(sample), fifo);
+        result = lane.queue.push(std::move(sample), true, !strict);
       } catch (...) {
         ++stats.failed;
         ++failed_samples_;
@@ -918,12 +929,12 @@ public:
       if (result == ue_bridge::PushResult::full) {
         ++stats.rejected;
         ++dropped_samples_;
-        if (fifo || recording_mode_) { delivery_failed_.store(true); }
+        delivery_failed_.store(true);
         if (stats.rejected == 1 || stats.rejected % 100 == 0) {
           RCLCPP_ERROR(
-            get_logger(), "queue overflow: key=%s rejected=%zu policy=%s; "
+            get_logger(), "queue overflow: key=%s rejected=%zu policy=FIFO; "
             "recording cannot be complete when FIFO samples are rejected",
-            key.c_str(), stats.rejected, fifo ? "FIFO" : "latest");
+            key.c_str(), stats.rejected);
         }
         return;
       }
@@ -951,7 +962,7 @@ private:
     const std::string topic = topic_from_key(sample.key, strip_prefix_);
     const std::string type = resolve_type(sample.key, topic, data, sample.payload_size);
     const bool pointcloud = type == "sensor_msgs/msg/PointCloud2";
-    const bool fifo = recording_mode_ || pointcloud;
+    const bool strict = recording_mode_ || pointcloud;
     std::size_t lane = 0;
     if (pointcloud) {
       if (next_lidar_lane_ >= static_cast<std::size_t>(lidar_worker_count_)) {
@@ -968,10 +979,10 @@ private:
         lane = realtime_lanes + next_bulk_lane_++ % (worker_count_ - realtime_lanes);
       }
     }
-    key_lanes_.emplace(sample.key, std::make_pair(lane, fifo));
+    key_lanes_.emplace(sample.key, std::make_pair(lane, strict));
     RCLCPP_INFO(get_logger(), "route: key=%s lane=%zu queue=%s type=%s",
-      sample.key.c_str(), lane, fifo ? "FIFO" : "latest", type.c_str());
-    return {lane, fifo};
+      sample.key.c_str(), lane, strict ? "FIFO" : "FIFO+coalesce", type.c_str());
+    return {lane, strict};
   }
 
   void report_stats(bool final)
@@ -1579,6 +1590,7 @@ private:
   bool recording_mode_;
   int recording_queue_depth_;
   int recording_qos_depth_;
+  int live_queue_depth_;
   int wait_for_recorder_ms_;
   int worker_count_;
   int lane_queue_depth_;
